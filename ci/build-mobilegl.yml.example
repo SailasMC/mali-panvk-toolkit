@@ -1,0 +1,80 @@
+name: Build MobileGL (DirectVulkan) renderer plugin
+
+# 目标：产出 libMobileGL.so（含 DirectGLES + DirectVulkan/Magma 两个后端），
+# 并打包成 FCL / ZalithLauncher 的「渲染器插件 APK」。
+#
+# 为什么用 CI：本机的 2 vCPU 编这套重 C++ 需要 ~10 小时；GitHub runner 4 核 ~20 分钟。
+#
+# 手动触发：Actions → 本工作流 → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      mobilegl_ref:
+        description: 'MobileGL 分支/tag/commit（默认 dev）'
+        required: true
+        default: 'dev'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout 本仓库（取打包脚本与工具）
+        uses: actions/checkout@v4
+
+      - name: Checkout MobileGL（含全部子模块）
+        uses: actions/checkout@v4
+        with:
+          repository: MobileGL-Dev/MobileGL
+          ref: ${{ inputs.mobilegl_ref }}
+          path: MobileGL
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 安装构建工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build cmake python3
+
+      - name: 设置 Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: 修正 SPIRV-Tools 的头文件（本机实测踩到的坑）
+        run: |
+          set -e
+          # SPIRV-Tools 会用 MGL 自己 vendored 的旧 spirv.hpp11，导致
+          # "no member named 'OpGraphARM'" 之类的编译错误 —— 用自带的正确头覆盖。
+          SR=MobileGL/3rdparty/glslang/External/spirv-tools/external/spirv-headers/include/spirv/unified1
+          if [ -f "$SR/spirv.hpp11" ]; then
+            cp -f "$SR"/spirv.hpp11 "$SR"/spirv.h "$SR"/spirv.hpp MobileGL/include/glslang/SPIRV/ 2>/dev/null || true
+            echo "覆盖后 OpGraphARM 计数: $(grep -c OpGraphARM MobileGL/include/glslang/SPIRV/spirv.hpp11 || true)"
+          fi
+
+      - name: 配置并编译 libMobileGL.so
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -e
+          NDK="$ANDROID_NDK_ROOT"
+          cmake -S MobileGL -B MobileGL/build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DMOBILEGL_BUILD_TEST=OFF -DMOBILEGL_BUILD_BENCHMARK=OFF \
+            -DMOBILEGL_BUILD_INTEGRATION_TEST=OFF -DMOBILEGL_BUILD_TRACE_REPLAY=OFF \
+            -DMOBILEGL_ENABLE_TRACY=OFF -DMOBILEGL_FORCE_RELEASE_OPT=ON
+          ninja -C MobileGL/build-android -j"$(nproc)"
+          echo "===== 产物 ====="
+          find MobileGL/build-android -name 'libMobileGL*.so' -exec ls -l {} \;
+          find MobileGL/build-android -name 'libMobileGL*.so' -exec sha256sum {} \;
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: libMobileGL
+          path: MobileGL/build-android/**/libMobileGL*.so
+          if-no-files-found: error
