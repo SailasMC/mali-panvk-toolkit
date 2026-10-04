@@ -1,9 +1,11 @@
-# 构建产物与驱动二进制（不要提交：许可 + 体积）
+# 构建产物与驱动二进制（不提交：许可 + 体积）
 *.so
 *.apk
-out/
-build/
-dist/
-work/
 *.o
 *.a
+
+# 只有在 repo 根之外出现的构建输出才忽略
+/out/
+/panvk-kbase-android/
+/work/
+/dist/
