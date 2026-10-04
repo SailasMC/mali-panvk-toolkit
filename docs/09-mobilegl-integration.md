@@ -582,3 +582,46 @@ at com.mojang.blaze3d.platform.NativeLibrariesBootstrap.loadLibrary(...)
 **验证方法**：把 `DT_NEEDED` 改回 `libvulkan.so`（原件），只保留 `DLOPEN=libvkpanvk_shim.so` + 垫片；
 若游戏能起来（Vulkan 仍走 blob，因为没人用垫片）⇒ 说明崩在"被 patch 的 MGL 被提前加载"。
 或者干脆走 §13 的路线（**改 MGL 源码内部直连 ICD**，完全不产生新的 `DT_NEEDED`）。
+
+---
+
+## 16. 🎉🎉🎉 全线打通！MobileGL 真的跑在我们的 PanVK 上了（只剩 WSI 崩溃）
+
+### 铁证（JVM 崩溃报告的原文）
+
+```
+#  SIGSEGV (0xb) at pc=0x000079b57af630, pid=11776, tid=11859
+# Problematic frame:
+# C  [libvulkan_freedreno.so+0xd7b630]  wsi_GetSwapchainImagesKHR+0x20
+```
+
+`libvulkan_freedreno.so` **就是我们自己编译的开源 Mali PanVK**。它在这个游戏进程里
+**被加载 → 初始化 → 建 instance/device → 走到创建交换链**，才在 **`wsi_GetSwapchainImagesKHR`** 里段错误。
+
+⇒ **整条链路成立**：
+```
+Minecraft 26.3
+  → MobileGL（DirectVulkan / Magma 后端）
+  → 垫片（导出 125 个 loader 风格入口）
+  → 我们的 PanVK（libvulkan_freedreno.so）
+  → /dev/mali0（kbase）
+     ✗ 崩在 wsi_GetSwapchainImagesKHR（Android WSI / VK_KHR_swapchain 那条路）
+```
+
+### 关键机理：`RTLD_GLOBAL` 预加载就是"劫持点"
+ZL2 在 `dlopenEngine()` 里先 `ZLBridge.dlopen("<nativeLibraryDir>/libvkpanvk_shim.so")`（**RTLD_GLOBAL**），
+再 dlopen 渲染器。垫片被放进**全局符号组**后，它导出的 **`vkGetInstanceProcAddr`** 会在全局查询里**抢先命中**，
+于是 MGL 在运行期通过 `vkGetInstanceProcAddr` 取到的入口**全部来自垫片** → 垫片转发给我们的 ICD。
+⇒ 因此 **`DLOPEN=libvkpanvk_shim.so` 是正确且必要的一步**（§15 的源码分析与此完全一致）。
+
+### 还差的一步（很小）
+只剩 **PanVK 自己的 Android WSI 崩溃**：`wsi_GetSwapchainImagesKHR`。
+可能的方向：
+1. 试与 WSI 相关的 env（WSI 平台/后端选择）；
+2. 给 PanVK 打一个 WSI 侧补丁（该函数附近的平台分支）；
+3. 换一份 PanVK 构建（例如其它针对 G720 的构建）对比 —— 注意之前测过的另一份 G720 构建
+   在 `eglInitialize` 路径就段错，说明 WSI 这块在不同构建间差异很大。
+
+**判据**：游戏日志里
+`OpenGL Renderer: Magma (MobileGL Core) (…)` 括号内出现 **`Mali-G720 MC12`**
+（不再是 `Mali-G720-Immortalis MC12`）。
