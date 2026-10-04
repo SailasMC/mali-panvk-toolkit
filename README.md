@@ -35,6 +35,15 @@
 
 ## 快速上手
 
+### 0. 不想自己搭构建机？用 GitHub CI
+
+本仓库带了一个工作流模板：[`ci/build-panvk.yml.example`](ci/build-panvk.yml.example)。
+把它复制成 `.github/workflows/build-panvk.yml` 并提交（GitHub 要求推送该目录的 token
+具备 `workflow` 权限，所以这里以模板形式提供），然后在 **Actions → Build PanVK
+(kbase / Android) → Run workflow** 里选好 profile（默认 `g720-v12-csf`），
+跑完即可在 Artifacts 里下载 `libvulkan_panfrost.so` ——
+**`docs/04` 里那一长串依赖坑，脚本里已经全部处理好了**。
+
 ### 1. 我的设备能用开源 Mali 驱动吗？
 
 ```bash
