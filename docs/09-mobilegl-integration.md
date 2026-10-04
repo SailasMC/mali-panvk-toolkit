@@ -423,3 +423,39 @@ comm -23 <(sort -u need.txt) <(readelf -sW --dyn-syms libvkpanvk_shim.so | awk '
 - `[vkshim] icd=… gipa=… gdpa=…` —— 驱动 dlopen 与入口获取是否成功；
 - `[vkshim] MISSING entrypoint: <name>` —— 我们的 ICD 没交出某个入口（最多 32 条），
   黑屏/闪退时这是**定位到具体函数**的最快线索。
+
+---
+
+## 13. ★★ 最终结论：顶替 `libvulkan*` 名字这条路**彻底封死**（实测两种垫片都卡死）
+
+在 §12 的完整垫片（导出 125/125 个 loader 风格入口，双路符号自查通过）基础上，做了两组**对照实验**：
+
+| 版本 | 插件 `lib/arm64-v8a/` 里放的 | 结果 |
+|---|---|---|
+| **v18** | `libMobileGL.so`（原件未改）+ **`libvulkan.so`** = 完整垫片 | 游戏**正常启动**（纹理图集都建好了）—— 但日志里是
+`Mali-G720-Immortalis MC12, Vulkan 1.3.247, Driver 44.1.0` = **厂商 blob** ✗
+（说明 MGL 试的第一顺位不是 `.so`，`.so` 那个名字**没被命中**）|
+| **v19** | 同上，但 **`.so` 与 `.so.1` 双名**都放完整垫片 | 游戏**卡死在 `[DEBUG] Calling JLI_Launch`** ✗（与 §9② 的裸 ICD 事故**同一症状**）|
+
+**⇒ 结论：只要插件目录里的 `libvulkan.so.1` 顶替了系统 loader，ZL2 的 JVM 就会卡死在启动路径上**
+—— 与垫片是否"完整"**无关**（v14 是裸 ICD 卡死，v19 是 125 入口的完整垫片**同样**卡死）。
+也就是说：**ZL2/LWJGL 在 JVM 启动早期就会解析/使用 Vulkan**，而我们的 `垫片 → PanVK` 链在那个时机**不能完成**
+（最可能是 PanVK 在 app 域做 kbase 初始化的时机问题）。
+
+顺带确认了一个**观测性**事实：Android 会**丢弃 app 的 stderr**，所以垫片里 `fprintf(stderr, "[vkshim] …")`
+的排障钩子在真机上**看不到**（`logcat` 里 0 行）—— 要看得改成走 `__android_log_print`。
+
+### 因此只剩最后一条路：**改 MobileGL 源码，让它直连我们的 ICD**
+
+为什么这条路**反而更稳**：
+- 不动任何系统库名字 → JVM 启动路径**完全不受影响**（v19 的卡死正是死在这）；
+- 我们的驱动**只在 MGL 真正要建 Vulkan instance 时**才被加载（游戏跑到渲染器阶段，不是 JVM 启动阶段）；
+- ICD 可直接当"loader"用：`dlopen(驱动)` → `vk_icdNegotiateLoaderICDInterfaceVersion(&7)` →
+  `vk_icdGetInstanceProcAddr`，§3/§8 的探针已经证明这一步在这台设备上**能成功**。
+
+具体改动（都在 `MobileGL/MG_Backend/DirectVulkan/Renderer/VulkanRenderer.cpp` 附近）：
+1. 用 `dladdr()` 求出**插件自身目录**；
+2. 优先 `dlopen("<自身目录>/libvulkan_freedreno.so")`，取 `vk_icdGetInstanceProcAddr`；
+3. 把该文件里的 Vulkan 入口调用（`vkCreateInstance`/`vkGetInstanceProcAddr`/…）替换为从 ICD 取函数指针
+   （§12 的生成器已经把 125 个函数**按参数类型分好类**，可直接复用它的分派逻辑）；
+4. 编译环境是热的：`ninja -C build-android` 增量重建 + 重链约 **5 分钟**。
