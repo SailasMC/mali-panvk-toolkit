@@ -516,3 +516,69 @@ Stacktrace:
 ### 本轮已做的兜底
 `mgl-panvk-v24.apk`（versionCode 24，内容 = 已知可跑的 v16 配置）已装回设备，
 保证 ZL2 能正常启动 26.3（MobileGL Direct(Vulkan) 满帧，但 Vulkan 仍走厂商 blob）。
+
+---
+
+## 15. ★★ 读 ZL2 源码定案：`DLOPEN` 机制正确、无害；LWJGL 崩另有原因
+
+直接读 `/root/zl2src/ZalithLauncher2-main` 的源码（原文如下，可复核）：
+
+```kotlin
+// game/plugin/renderer/RendererPluginManager.kt:110-125   —— pojavEnv 解析
+pojavEnvString.split(":").forEach { envString ->
+    if (envString.contains("=")) {
+        val key = envString.split("=")[0]; val value = envString.split("=")[1]
+        when (key) {
+            "POJAV_RENDERER" -> rendererId = value
+            "DLOPEN" -> value.split(",").forEach { lib -> dlopenList.add(lib) }   // 按逗号拆
+            "LIB_MESA_NAME", "MESA_LIBRARY" -> envList[key] = "$nativeLibraryDir/$value"
+            else -> envList[key] = value                                          // 其它键原样进 env
+        }
+    }
+}
+
+// game/plugin/renderer/RendererPlugin.kt:48                     —— v1 插件的 dlopen 列表
+override fun getDlopenLibrary(): Lazy<List<String>> = lazy { dlopen.map { lib -> "$path/$lib" } }  // ★ 补成绝对路径
+override fun getRendererLibrary(): String = "$path/$glName"
+
+// game/launch/GameLauncher.kt:208-222                           —— 预加载时机
+override fun dlopenEngine() {
+    super.dlopenEngine()
+    RendererPluginManager.selectedRendererPlugin?.let { renderer ->
+        val libs by renderer.getDlopenLibrary()
+        libs.forEach { libPath -> ZLBridge.dlopen(libPath) }      // ★ 先预加载（绝对路径）
+    }
+    val rendererLib = getRendererLibrary() ?: return
+    if (!ZLBridge.dlopen(rendererLib) && !ZLBridge.dlopen(findInLdLibPath(rendererLib))) { … }  // 再 dlopen 渲染器
+}
+
+// game/launch/GameLauncher.kt:274-280                           —— 运行期库搜索路径
+override fun getRuntimeLibraryPath(): String {
+    val parent = super.getRuntimeLibraryPath()
+    return jnaDir?.absolutePath?.let { dirPath -> "$parent:$dirPath" } ?: parent   // ★ 不含插件目录
+}
+```
+
+**定案**：
+1. `DLOPEN=<名字>` 的语义是**纯预加载**：ZL2 把它拼成 `"$nativeLibraryDir/<名字>"`（绝对路径），
+   在 dlopen 渲染器之前调 `ZLBridge.dlopen(...)`。**它不修改任何库搜索路径**。
+   ⇒ §14 里"v22/v23 的 LWJGL 崩是 `DLOPEN` 造成的"这个怀疑**不成立**（v23 只写 `pojavEnv` 也崩，但机制上它无害）。
+2. **`getRuntimeLibraryPath()` 确实不含插件目录**（只有 `super + jnaDir`）。
+   ⇒ 这正是 §14 那条 `library "libvkpanvk_shim.so" not found … in namespace clns-9` 的根源：
+   **裸名 `DT_NEEDED` 不会被解析**，而 `DLOPEN` 预加载恰好能补上（预加载后同名 soname 已在命名空间里）。
+   ⇒ 所以 **`DLOPEN=libvkpanvk_shim.so` 是正确且必要的做法**。
+
+**那 LWJGL 为什么崩？** 观察到的原文是：
+```
+Contents of org.lwjgl.librarypath:            ← 空
+    liblwjgl.so: unknown type  … libshaderc.so: unknown type
+at com.mojang.blaze3d.platform.NativeLibrariesBootstrap.loadLibrary(...)
+```
+这更像**原生库目录没被正确设置/解压**（`org.lwjgl.librarypath` 为空、`java.library.path` 显示 `<not a directory>`），
+而不是 `DLOPEN` 引起的。**下一步应查**：v22/v23 与可用版本（v16/v18/v24）之间**唯一的差异** ——
+**被 `patchelf` 改过 `DT_NEEDED` 的 `libMobileGL.so`**。
+最可能的情形：ZL2 在**预加载之前**（例如渲染器列表/设置页）就会尝试加载 `libMobileGL.so`，
+此时 `libvkpanvk_shim.so` 尚未进入命名空间 ⇒ 加载失败并留下破状态。
+**验证方法**：把 `DT_NEEDED` 改回 `libvulkan.so`（原件），只保留 `DLOPEN=libvkpanvk_shim.so` + 垫片；
+若游戏能起来（Vulkan 仍走 blob，因为没人用垫片）⇒ 说明崩在"被 patch 的 MGL 被提前加载"。
+或者干脆走 §13 的路线（**改 MGL 源码内部直连 ICD**，完全不产生新的 `DT_NEEDED`）。
