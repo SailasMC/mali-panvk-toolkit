@@ -162,3 +162,4 @@ APK 里只有 `<meta-data name="fclPlugin">` 而没有带 `LAUNCHER` 的 Activit
 > 注意：不附带任何 FCL / ZL2 的二进制产物，也不附带 PanVK 驱动本体。
 > 本仓库只提供**工具、脚本、文档**，由使用者自行获取上游产物。
 | [`docs/07-our-build-and-results.md`](docs/07-our-build-and-results.md) | ★ 我们编出的 G720 PanVK 实测结果与启动器侧卡点 |
+| [`docs/08-mobilegl-vulkan.md`](docs/08-mobilegl-vulkan.md) | ★ MobileGL 的 Vulkan 后端（Magma）与渲染器插件契约 |

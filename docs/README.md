@@ -9,3 +9,4 @@
 | [05-findings.md](05-findings.md) | 两个上游成品驱动的实测对比、崩溃栈分析与结论 |
 | [06-roadmap.md](06-roadmap.md) | 路线图：渲染器层次（Zink / MobileGL / 原生 Vulkan）、「自己优化驱动」的现实边界与测试顺序 |
 | [07-our-build-and-results.md](07-our-build-and-results.md) | ★ 我们自己的构建结果与实测卡点（含 FCL 空指针、ZL2 加载顺序的日志证据）|
+| [08-mobilegl-vulkan.md](08-mobilegl-vulkan.md) | ★ MobileGL（MGL）调研：两个后端、渲染器插件契约、如何接上我们的 PanVK |
