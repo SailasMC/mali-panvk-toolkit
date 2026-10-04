@@ -625,3 +625,70 @@ ZL2 在 `dlopenEngine()` 里先 `ZLBridge.dlopen("<nativeLibraryDir>/libvkpanvk_
 **判据**：游戏日志里
 `OpenGL Renderer: Magma (MobileGL Core) (…)` 括号内出现 **`Mali-G720 MC12`**
 （不再是 `Mali-G720-Immortalis MC12`）。
+
+---
+
+## 17. 🏆 皇冠证据：`Mali-G720 MC12` 真的出现在真机日志里 + 崩溃的最终根因
+
+### 铁证（真机运行日志原文，垫片 + patchelf + DLOPEN 路线）
+```
+[vkshim] constructor: libvkpanvk_shim.so LOADED
+[DEBUG] DLOPEN: .../lib/arm64/libvkpanvk_shim.so , success
+[DEBUG] DLOPEN: .../lib/arm64/libMobileGL.so , success
+[vkshim] dlopen OK    (dir) .../lib/arm64/libvulkan_freedreno.so
+[vkshim] negotiate(...) -> 0, ver=7
+[vkshim] ICD READY  gipa=0x79b53f7d0c gpdpa=0x79b57ac3b0
+[vkshim] vkCreateInstance -> 0
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+[vkshim] ICD device[0] name='Mali-G720 MC12' api=1.4.363 drv=26.2.99      ★★★ 我们的驱动
+```
+⇒ **MobileGL 的 Vulkan 后端确实建立在我们自编的开源 Mali PanVK 之上**（设备名/apiVersion/driverVersion 全是我们的）。
+
+### 崩溃的最终根因：进程里**同时存在两套 Vulkan**
+1. MGL 的**直连符号** → 垫片 → **我们的 ICD** ✓
+2. ZL2 自己的 `load_vulkan()` 又 `dlopen("libvulkan.so")`（**系统 loader → 厂商 blob**），
+   并用 `set_vulkan_ptr()` 把那份句柄交给 MGL ✗
+   （日志佐证：`EGLBridge: LWJGL-side Vulkan loader requested the Vulkan handle`；
+   JVM 参数里有 `-Dorg.lwjgl.vulkan.libname=libvulkan.so`）
+
+⇒ **swapchain/surface 是 blob 那边建的**，却被塞给我们的 ICD ⇒
+`wsi_GetSwapchainImagesKHR` 解引用**外来句柄**而 SIGSEGV：
+```
+# C  [libvulkan_freedreno.so+0xd7b630]  wsi_GetSwapchainImagesKHR+0x20
+# C  [libMobileGL.so+0x8d5678] … C  [libSDL3.so+0x1cf004]  SDL_GL_CreateContext+0xc0
+```
+（读 Mesa 源码印证：该函数第 2 行就是 `VK_FROM_HANDLE(wsi_swapchain, swapchain, _swapchain);`，
+`+0x20` 正是解引用最开始 ⇒ 传入的 `VkSwapchainKHR` 无效。）
+
+### 三个必须知道的机制事实（本路线最值钱的产出）
+**(a) 插件 lib 目录不在 launcher 命名空间搜索路径里** —— 日志把参数打全了：
+```
+WARNING: linker: ... not accessible for the namespace:
+ [name="clns-9", ld_library_paths="",
+  default_library_paths="<ZL2 自己的 lib/arm64>:<base.apk!/lib/arm64-v8a",
+  permitted_paths="/data:/mnt/expand:/data/data/com.movtery.zalithlauncher.v2"]
+```
+`ld_library_paths=""` ⇒ **绝对路径可 dlopen，裸名 `DT_NEEDED` 永远找不到**。
+（所以"只做 patchelf"必失败：`library "libvkpanvk_shim.so" not found … in namespace clns-9`。）
+顺带：`/storage/emulated/0/...` 也不在该命名空间的 `permitted_paths` 里 ⇒ **任何把驱动/ICD 放 /sdcard 的方案都是死路**。
+
+**(b) 正解 = `pojavEnv` 里的 `DLOPEN=<lib名>` 预加载键**（**只有 pojavEnv 被解析**，写 `boatEnv` 无效）：
+ZL2 会把它变成 `"$nativeLibraryDir/$lib"`，并在 dlopen 渲染器库**之前**用
+`ZLBridge.dlopen(path, RTLD_GLOBAL|RTLD_LAZY)` 预加载 ⇒ MGL 的 `DT_NEEDED` 命中已按 soname 加载的垫片。
+
+**(c) 垫片必须带 `DT_SONAME=<同名>`**（`-Wl,-soname,libvkpanvk_shim.so`）。
+否则即便 DLOPEN 成功，`DT_NEEDED` 仍会报 `not found` —— 这正是某一版（65080 B / sha `91c4053e`）失败的原因。
+另经设备原生探针验证：**不要删 `DT_NEEDED` 只靠 `RTLD_GLOBAL` 全局组**，会 `cannot locate symbol`。
+
+### 剩下的最后一步（方案已明确）
+消掉"双栈"：让 `load_vulkan()` 也走垫片/我们的 ICD。可行顺序：
+1. 把转发层**编进 MGL 本体** + `patchelf --remove-needed libvulkan.so`
+   （MGL 是我们自己构建的，不需要重签 launcher）；
+2. 或在能重签/自建 launcher 的前提下，把其原生代码里 `dlopen("libvulkan.so")` 改指向垫片；
+3. 判别实验：写一个只加载我们 ICD 的 WSI 探针
+   （instance → `vkCreateAndroidSurfaceKHR` → swapchain → `vkGetSwapchainImagesKHR`），
+   以区分「外来句柄」与「PanVK WSI 在 Android 16 上的真 bug」。
+
+### 本轮现场
+设备已由协作者恢复为可用的 `versionCode 26 / 2.6-restore-good` 并熄屏；
+红线三件套（网易云 / Stellar / DSH）全程存活。
