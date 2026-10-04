@@ -93,6 +93,42 @@ cd panvk-kbase-android
 > 插到 bionic 头文件前面，污染整个交叉编译。
 > 正确做法是把**缺的那个子目录**软链进自己的 deps include 目录。
 
+| # | 报错 | 原因 | 解法 |
+|---|---|---|---|
+| 8 | 链接期：`/usr/lib/x86_64-linux-gnu/libX11.so is incompatible with aarch64linux`（以及 libdrm/libz/libSPIRV-Tools 一长串）| **宿主 pkg-config 泄漏进目标链接**。`build-android.sh` 本会把目标 pkg-config 限制到 `work/android-deps/lib/pkgconfig` + `work/android-deps-x11/lib/pkgconfig`，**但只在 `work/android-deps/lib/pkgconfig` 存在时才做** | `mkdir -p work/android-deps/lib/pkgconfig`（哪怕先建空目录），交叉文件里就会出现 `pkg_config_libdir = [...]` |
+| 9 | 限制 pkg-config 后：`ERROR: Dependency "libdrm" not found` | `work/android-deps` 里应该有**为 aarch64 构建的 libdrm**，作者是在自己设备上手工准备的；仓库里没有生成脚本 | 交叉编译一份静态 libdrm（见下） |
+| 10 | 链接期：`undefined symbol: drmSyncobjWait / drmSyncobjReset / drmSyncobjCreate`（来自 `panvk_async_bind.c`、`panvk_vX_gpu_queue.c`）| panvk 的队列/同步代码**确实会调用 libdrm**，所以不能只给一个空 `Libs:` 的 stub | 同上：必须提供**真的** libdrm（静态最好，设备端就不需要额外的 `.so`）|
+
+### 自己交叉编译静态 libdrm
+
+```bash
+export PATH=/opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+git clone --depth 1 https://gitlab.freedesktop.org/mesa/drm.git && cd drm
+meson setup build-android --cross-file <你的交叉文件> \
+  -Dtests=false -Dudev=false -Dvalgrind=disabled \
+  -Dintel=disabled -Dradeon=disabled -Damdgpu=disabled -Dnouveau=disabled -Dvmwgfx=disabled \
+  -Ddefault_library=static \
+  --prefix=<repo>/work/android-deps --libdir=lib
+ninja -C build-android install
+```
+
+> 注意：新版 libdrm 已没有 `-Dlibkms` / `-Dfreedreno` 选项，带上会报 `Unknown options`。
+> 另外 meson 需要 `aarch64-linux-android<API>-clang` **在 PATH 里**（`build-android.sh` 内部会加，
+> 你手跑 meson 时要自己加）。
+
+### 终极注意：meson 会缓存「找不到依赖」的结论
+
+即使把 `libdrm.pc` 换成真的，**`--reconfigure` 也不会重新评估它**，
+`build.ninja` 里依旧没有 `libdrm.a`。同理，**交叉文件（cross file）的改动也不会被 `--reconfigure` 重读**。
+两者都只能靠**换一个新的构建目录**解决：
+
+```bash
+export BDIR=$PWD/build/android-vN     # 每改一次配置就 +1
+```
+
+（好在 `libdrm` 会以**绝对路径**写进 `build.ninja`，用
+`grep -c libdrm build/android-vN/build.ninja` 比 `grep -- -ldrm` 更可靠。）
+
 ### 改了交叉文件后必须重新 configure
 
 `meson setup --reconfigure` **不会**重新读取交叉文件！实测：改了 `c_args` 后
