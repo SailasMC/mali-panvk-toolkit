@@ -7,3 +7,4 @@
 | [03-fcl-adreno-lock.md](03-fcl-adreno-lock.md) | ⭐ FCL / ZL2 的 Adreno 厂商锁：源码定位、日志证据、三种拆锁方案 |
 | [04-build-g720-panvk.md](04-build-g720-panvk.md) | 构建 G720/v12 PanVK 的完整流程 + 依赖踩坑清单 |
 | [05-findings.md](05-findings.md) | 两个上游成品驱动的实测对比、崩溃栈分析与结论 |
+| [06-roadmap.md](06-roadmap.md) | 路线图：渲染器层次（Zink / MobileGL / 原生 Vulkan）、「自己优化驱动」的现实边界与测试顺序 |

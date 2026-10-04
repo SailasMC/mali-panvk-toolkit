@@ -9,3 +9,7 @@
 /panvk-kbase-android/
 /work/
 /dist/
+
+# GitHub Actions 工作流：模板放在 ci/ 下。
+# （推送 .github/workflows/** 需要 token 具备 workflow 权限，这里刻意不直接提交）
+.github/
