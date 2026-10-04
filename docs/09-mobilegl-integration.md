@@ -119,3 +119,53 @@ MobileGL 的 Magma 后端用**标准 Vulkan loader**，其 ICD 搜索可用
 3. 若 Magma 初始化失败：用 `MOBILEGL_BACKEND_TYPE=DirectGLES` 做对照（区分是「插件没生效」还是「Magma 在我们的驱动上有问题」）
 
 **已排除**：`libMobileGL.so` 的 Vulkan 后端确实编进去了（`strings` 命中 115 处 `DirectVulkan|Magma`）✓
+
+---
+
+## 7. 实测结果（2026-10-05 凌晨，OPPO PHX110 / 天玑9300 / Immortalis-G720 MC12 / Android 16）
+
+### ✅ 已验证：MobileGL 的 Direct (Vulkan) 后端在本机可用
+
+ZL2（版本 `26.3 Fabric`）启动日志：
+
+```
+▷ Renderer: MobileGL Magma_1001_Vulkan(OpenGL 4.6,1.17+)
+▷ Renderer Summary: 来自 MobileGL Magma 插件
+▷ POJAVEXEC_EGL = libMobileGL.so
+[DEBUG] DLOPEN: …/com.mio.plugin.renderer.MGL.Magma-…/lib/arm64/libMobileGL.so , success
+[06:29:36] Using graphics backend OpenGL, using drivers:
+           4.6.0 MobileGL 26.09-dev, Direct (Vulkan) Backend, GIT@cbbaf77
+```
+
+游戏内 **FPS 稳定 59–60** ✓（`FPS: 59` / `FPS: 60` 出现在 ZL2 的悬浮层）。
+
+**⇒ 结论：MobileGL 的 Magma = Direct(Vulkan) 路径在这台 Mali 设备上完全能跑，帧率满血。**
+
+### ⚠️ 当时用的驱动是厂商 blob，不是我们的 PanVK
+
+同一份日志里出现 **`Mali-G720-Immortalis MC12`**（厂商 blob 的设备名）。
+我们编的 PanVK 设备名是 **`Mali-G720 MC12`**（不带 `-Immortalis`）—— 所以「是否用上我们的驱动」有一个**一眼可判的指纹** ✓。
+
+### 🔧 让 MGL 用上我们 PanVK 的做法（已就绪，待最终验证）
+
+社区插件（`com.mio.plugin.renderer.MGL.Magma`）的清单里 **没有** `VK_ICD_FILENAMES`（所以走 blob）。
+本仓库的 v12 插件复刻了它的全部契约并**追加**了 ICD 指向：
+
+```
+renderer = magma_panvk:libMobileGL.so:libMobileGL.so     # 用独立 id，避免与社区版 magma 撞车
+pojavEnv = LIBGL_ES=3:POJAV_RENDERER=opengles3:MOBILEGL_BACKEND_TYPE=DirectVulkan
+           :MOBILEGL_ESPRYT_USE_ANGLE=0:MOBILEGL_MAGMA_R11G11B10F_FALLBACK=0
+           :VK_ICD_FILENAMES=/storage/emulated/0/mali-icd/panvk_icd.json   ← 关键
+```
+（`libMobileGL.so` 直接采用**社区版那个已验证的**构建，唯一变量隔离到「驱动来源」上。）
+
+### 经验：改别人签名的插件装不上
+
+重打包社区插件的包名 + 用我们的 key 签名 → 安装会因**签名不符**失败。
+**可行做法**：复刻它的 meta-data 到自己能更新的包名里（本文的 v12）。
+
+### 经验：自动化点按的两条通道
+
+- **无障碍通道**（`android_ui_*`）：能读语义树，但每次调用可能把 Harness 自己的前台抢回来，导致点按落空。
+- **ADB 注入**（本仓库环境里的 `android_act_input`）：不经过无障碍、**不会抢前台**，成功点中了启动器的「启动游戏」；
+  但它注入的 `HOME`/`BACK`/手势会被**沉浸式游戏**吞掉。
