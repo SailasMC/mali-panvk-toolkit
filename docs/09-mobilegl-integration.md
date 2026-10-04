@@ -459,3 +459,60 @@ comm -23 <(sort -u need.txt) <(readelf -sW --dyn-syms libvkpanvk_shim.so | awk '
 3. 把该文件里的 Vulkan 入口调用（`vkCreateInstance`/`vkGetInstanceProcAddr`/…）替换为从 ICD 取函数指针
    （§12 的生成器已经把 125 个函数**按参数类型分好类**，可直接复用它的分派逻辑）；
 4. 编译环境是热的：`ninja -C build-android` 增量重建 + 重链约 **5 分钟**。
+
+---
+
+## 14. ★★ `DLOPEN` 键的正确用法与它的副作用（未解，留给后续）
+
+### 根因（原文证据，来自子代理的设备实测）
+把「完整垫片」按**唯一名**放进插件 lib 目录、再用 `patchelf --replace-needed` 把
+`libMobileGL.so` 的 `DT_NEEDED` 指向它，**仍然失败**：
+
+```
+dlopen failed: library "libvkpanvk_shim.so" not found:
+  needed by /data/app/~~…/com.dsh.plugin.driver.g720-…/lib/arm64/libMobileGL.so
+  in namespace clns-9
+```
+
+⇒ MGL 是被 ZL2 用**绝对路径** dlopen 的，它所在的 classloader 命名空间（`clns-9`）
+**搜索路径里没有插件 lib 目录**（绝对路径能开，**裸名不行**）⇒ 裸名 `DT_NEEDED` 必然失败。
+
+### 已知的正确方向
+ZL2 的 `RendererPluginManager` 支持 `pojavEnv` 里的特殊键 **`DLOPEN=<lib名>`**（逗号分隔）：
+`RendererPlugin.getDlopenLibrary()` 会解析成 `"$nativeLibraryDir/$lib"`，
+并在 dlopen 渲染器库**之前**调 `ZLBridge.dlopen(path, RTLD_GLOBAL|RTLD_LAZY)`。
+子代理**在设备上用原生探针实测通过**这条链：
+预加载垫片 → dlopen(patched libMobileGL.so) → `vkCreateInstance` → 垫片 → ICD
+→ **`ICD device[0] name='Mali-G720 MC12' api=1.4.363`** ✔
+
+同时它还实测否掉了一条路：**不写 `DT_NEEDED`、只靠 `RTLD_GLOBAL` 解析 UND 符号**会失败
+（`cannot locate symbol "dep_value"`）⇒ 垫片仍必须被 `DT_NEEDED` 引用。
+
+### ⚠️ 但把 `DLOPEN` 写进插件清单后，**ZL2 启动游戏会失败**（两次实测）
+现象（v22 把 `DLOPEN` 同时写进 `pojavEnv` 和 `boatEnv`；v23 只写 `pojavEnv` —— **都一样**）：
+
+```
+Contents of org.lwjgl.librarypath:            ← 空
+    liblwjgl.so: unknown type
+    liblwjgl_opengl.so: unknown type
+    …（LWJGL 自身的全部原生库都"认不出"）
+Stacktrace:
+    at com.mojang.blaze3d.platform.NativeLibrariesBootstrap.loadLibrary(…:200)
+    at … NativeLibrariesBootstrap.loadLibraries(…:104)
+    at net.minecraft.client.main.Main.main(…:142)
+    at mio.Wrapper.main(Wrapper.java:21)
+```
+
+⇒ **`DLOPEN` 键不只做"预加载"**：它显然还影响了 LWJGL 原生库路径的构建/查找
+（`org.lwjgl.librarypath` 变空、`liblwjgl*.so: unknown type`）。
+
+### 下一步（明确的排查点）
+去 ZL2 源码看 **`RendererPlugin.getDlopenLibrary()` 的调用点**：
+- 若它只被 `ZLBridge.dlopen(path, RTLD_GLOBAL)` 消费 → 问题在别处（可能是它同时改写了 libraryPath）；
+- 若它被用来**拼接 `libraryPath`** → 应把 **LWJGL 原生库目录 + 垫片**一起列出，或改用别的手段预加载
+  （例如把垫片**改名为 MGL 恰好会找的名字**并放到 **LWJGL 能找到的目录**，或直接改 MGL 源码用
+  `dladdr` + `vk_icdGetInstanceProcAddr` 内部直连 —— 见 §13）。
+
+### 本轮已做的兜底
+`mgl-panvk-v24.apk`（versionCode 24，内容 = 已知可跑的 v16 配置）已装回设备，
+保证 ZL2 能正常启动 26.3（MobileGL Direct(Vulkan) 满帧，但 Vulkan 仍走厂商 blob）。
