@@ -1,0 +1,9 @@
+# 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [01-why-mali.md](01-why-mali.md) | 背景：为什么 Mali 玩家需要这个项目；启动器驱动插件的来龙去脉 |
+| [02-kbase-bringup.md](02-kbase-bringup.md) | 免 root 驱动 Mali kbase 的原理、握手坑、实测数据与自检方法 |
+| [03-fcl-adreno-lock.md](03-fcl-adreno-lock.md) | ⭐ FCL / ZL2 的 Adreno 厂商锁：源码定位、日志证据、三种拆锁方案 |
+| [04-build-g720-panvk.md](04-build-g720-panvk.md) | 构建 G720/v12 PanVK 的完整流程 + 依赖踩坑清单 |
+| [05-findings.md](05-findings.md) | 两个上游成品驱动的实测对比、崩溃栈分析与结论 |
