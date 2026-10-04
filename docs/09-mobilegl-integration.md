@@ -370,3 +370,56 @@ loader 依然选了 vendor blob。**Android 上这条路封死。**
 把 125 个入口换成从 ICD 取（改动量比 A 大，但更"干净"、也更容易上游化）。
 
 两条路都**不需要** Android loader 配合，因此都能绕开本节的封堵。
+
+---
+
+## 12. ★★ 解法：自建「完整 Vulkan 转发垫片」，冒充 `libvulkan.so`
+
+### 为什么可行
+Android 的系统 loader 不认 `VK_ICD_FILENAMES`（§11 铁证），但**插件目录在 linker 搜索里优先于系统目录**
+（§9② 的"卡死事故"恰好证明了这种优先级的真实存在）。
+所以：**用我们自己的完整实现顶掉 `libvulkan.so` 这个名字**，只影响这一个进程。
+
+与 §9② 那次失败的关键区别：
+| | §9② 失败版本 | 本节正确版本 |
+|---|---|---|
+| 放置的东西 | 我们的**裸 ICD** | **完整转发层** |
+| 导出 | 只有 `vk_icd*` | **125 个 loader 风格入口** |
+| 结果 | JVM 找不到入口 → 卡死在 `JLI_Launch` | 任何 Vulkan 使用方都能正常工作 |
+
+### 垫片怎么来（可复现）
+1. 取 MobileGL 的未定义符号清单（`libMobileGL.so` 里 UND 的 `vk*`）——**125 个**；
+2. **写生成器**：从 NDK 的 `vulkan/vulkan_core.h` + `vulkan_android.h` 解析
+   `typedef <ret> (VKAPI_PTR *PFN_<name>)(<params>);`，自动生成转发函数；
+3. 每类按首参分派：
+   - `VkInstance` / `VkPhysicalDevice` → `g_gipa(<首参>, "<name>")`
+   - `VkDevice` / `VkQueue` / `VkCommandBuffer` → `g_gdpa(<设备>, "<name>")`（命令缓冲没有 device 时用**缓存的 `g_dev`**）
+   - 无参数或首参不是可调度句柄（`vkCreateInstance`、`vkEnumerateInstanceExtensionProperties`）→ `g_gipa(NULL, "<name>")`
+   - `vkEnumerateInstanceLayerProperties` **自己实现**（0 层、`VK_SUCCESS`）
+4. `g_gipa` / `g_gdpa` 的来源：`dlopen(我们的 ICD)` → `vk_icdNegotiateLoaderICDInterfaceVersion(&7)` →
+   `dlsym("vk_icdGetInstanceProcAddr")`；device 级经 `gipa(NULL,"vkGetDeviceProcAddr")` 取。
+5. 编译：`aarch64-linux-android28-clang -shared -fPIC -O2 -o libvkpanvk_shim.so vkshim.c -ldl`
+6. **把垫片以 `libvulkan.so` 之名放进插件 APK 的 `lib/arm64-v8a/`**，MGL 原件**一个字节都不用改**。
+
+### ★ 生成器里两个必须避开的坑（都实际踩过）
+1. **正则不能跨 typedef**：
+   `typedef\s+(.+?)\s*\(VKAPI_PTR\s*\*\s*PFN_<name>\)`（`re.S`）会从**文件里最靠左的 `typedef`** 开始吞，
+   把整段 struct/flag 定义当成"返回类型"——症状是 `vkCreateInstance` 的返回类型变成几 KB 的块，
+   `vkCreateAndroidSurfaceKHR` 变成 `VkFlags VkAndroidSurfaceCreateFlagsKHR; …`。
+   **修法**：返回类型组限制为 `[^;{}]*?`（或等价地只允许 标识符/空白/星号），并加断言 `;{}`/长度上限。
+2. **`vkCreateInstance` / `vkEnumerateInstanceExtensionProperties` 不是无参**——
+   它们有参数，只是首参**不是可调度句柄**；分类规则要用"首参类型"而不是"有没有参数"。
+
+### 自查（一条命令）
+```bash
+# 导出清单（注意必须排除 STT_FILE 伪符号，否则 vkshim.c 会被算进去凑成 126）
+readelf -sW --dyn-syms libvkpanvk_shim.so | awk '$4!="FILE" && $7!="UND" && $8~/^vk/{print $8}' | sort -u | wc -l   # 期望 125
+# 与需求求差
+comm -23 <(sort -u need.txt) <(readelf -sW --dyn-syms libvkpanvk_shim.so | awk '$4!="FILE" && $7!="UND" && $8~/^vk/{print $8}' | sort -u)   # 期望空
+```
+
+### 真机排障钩子
+垫片在 stderr 打两类日志（进 `logcat` 即可见）：
+- `[vkshim] icd=… gipa=… gdpa=…` —— 驱动 dlopen 与入口获取是否成功；
+- `[vkshim] MISSING entrypoint: <name>` —— 我们的 ICD 没交出某个入口（最多 32 条），
+  黑屏/闪退时这是**定位到具体函数**的最快线索。
