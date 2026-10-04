@@ -330,3 +330,43 @@ logcat -d | grep -iE "vk_icd|VK_ICD|ICD .*(load|found|skip)|libvulkan"
 - 若打印 `ICD … not found / skipped` → 是**路径/权限/ABI** 问题，可对症修（例如路径不可执行、缺依赖）；
 - 若**完全没提** `VK_ICD_FILENAMES` → 确认是 AOSP 的 loader 安全限制，只能回到"改 MGL 源码直接 dlopen 驱动"；
 - 若打印 `loading … ok` 但最终仍选 blob → 是 **loader 内部策略**（如只信任 vendor 目录），需查该 ROM 的 loader 实现。
+
+---
+
+## 11. ★★ 铁证：Android loader 确实忽略 `VK_ICD_FILENAMES`
+
+2026-10-05 07:03 实测（ZL2 `26.3 Fabric`，插件 `MobileGL Magma + PanVK` v16 带 `VK_LOADER_DEBUG=all`）：
+
+```
+[07:03:38] [Render thread/INFO]: Using graphics backend OpenGL, using drivers:
+           4.6.0 MobileGL 26.09-dev, Direct (Vulkan) Backend, GIT@cbbaf77
+[07:03:41] [Render thread/INFO]: OpenGL Renderer: Magma (MobileGL Core)
+           (Mali-G720-Immortalis MC12, Vulkan 1.3.247, Driver 44.1.0)
+```
+
+**版本号就是铁证**（设备名还可能是巧合，版本号不是）：
+
+| | deviceName | apiVersion | driverVersion |
+|---|---|---|---|
+| **实际生效（厂商 blob）** | `Mali-G720-Immortalis MC12` | **1.3.247** | **44.1.0** |
+| **我们的 PanVK**（独立探针实测） | `Mali-G720 MC12` | **1.4.363** | 26.2.24.3 |
+
+⇒ 即使 `VK_ICD_FILENAMES` 已确认注入进程（日志里有 `▷ VK_ICD_FILENAMES = …`），
+loader 依然选了 vendor blob。**Android 上这条路封死。**
+
+另外：`VK_LOADER_DEBUG=all` 的输出**没进 logcat** —— Android app 的 stderr 默认被丢弃，
+所以 loader 的内部诊断在这个环境下拿不到。
+
+### 结论：只剩两条可行路
+
+**(A) 写一个导出 Vulkan 核心 API 的垫片 .so**（推荐、不动 MGL 源码）
+- MGL 的 `libMobileGL.so` 有 **125 个** `vk*` UND 符号（loader 风格），我们的 ICD 只导出 `vk_icd*`；
+- 垫片要导出这 125 个名字，内部 `dlopen` 我们的驱动 → `vk_icdGetInstanceProcAddr` → 逐一分发；
+- **可自动生成**：从 `vulkan_core.h` + `vulkan_android.h` 解析函数签名，脚本生成 C 转发层；
+- 然后把 `libMobileGL.so` 的 `DT_NEEDED: libvulkan.so` 用 `patchelf --replace-needed` 指向垫片
+  （垫片名要**唯一**，例如 `libvkpanvk_shim.so` —— 千万不能叫 `libvulkan.so.1`，那会进程级污染并卡死 JVM，见 §9②）。
+
+**(B) 改 MobileGL 源码**：在它的 Vulkan 初始化处优先用 `vk_icdGetInstanceProcAddr`，
+把 125 个入口换成从 ICD 取（改动量比 A 大，但更"干净"、也更容易上游化）。
+
+两条路都**不需要** Android loader 配合，因此都能绕开本节的封堵。
