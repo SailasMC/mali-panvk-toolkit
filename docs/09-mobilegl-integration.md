@@ -169,3 +169,50 @@ pojavEnv = LIBGL_ES=3:POJAV_RENDERER=opengles3:MOBILEGL_BACKEND_TYPE=DirectVulka
 - **无障碍通道**（`android_ui_*`）：能读语义树，但每次调用可能把 Harness 自己的前台抢回来，导致点按落空。
 - **ADB 注入**（本仓库环境里的 `android_act_input`）：不经过无障碍、**不会抢前台**，成功点中了启动器的「启动游戏」；
   但它注入的 `HOME`/`BACK`/手势会被**沉浸式游戏**吞掉。
+
+---
+
+## 8. ★ 致命坑：`/storage` 是 noexec —— ICD 必须指向「可执行路径」
+
+把 `libvulkan_freedreno.so` 放在 `/storage/emulated/0/...` 并在 ICD JSON 里引用它，**必然失败**：
+
+```
+✘ dlopen failed: couldn't map ".../libvulkan_freedreno.so" segment 2: Permission denied
+```
+
+因为 Android 的 `/sdcard`(FUSE) 挂载带 **noexec**。ICD 的 `library_path` **必须指向可执行目录**。
+
+**唯一可靠的可执行路径 = 插件自己的 `nativeLibraryDir`**：
+
+```
+/data/app/~~XXXX==/<你的包名>-YYYY==/lib/arm64/       ← 可执行 ✓（且能放我们的 .so）
+```
+（`/data/data/<pkg>/files` 自 Android 10 起也是 noexec；`/data/local/tmp` 只对 shell 可执行，app 受 SELinux 限制。）
+
+**正确分工**：
+| 文件 | 放哪 | 为什么 |
+|---|---|---|
+| `panvk_icd.json` | `/storage/emulated/0/mali-icd/` | 只需**可读**（app 有存储权限即可）|
+| `libvulkan_freedreno.so` | **插件 APK 的 `lib/arm64-v8a/`** | 只有这里**可执行** ✓ |
+| `VK_ICD_FILENAMES` | 插件 `pojavEnv` 里的字面量 → 指向上面那个 json | 路径里不能含冒号 |
+
+**路径怎么来**：装好插件后读 `pm path <包名>`，取 `/lib/<abi>` 前缀并写进 json 的 `library_path`
+（注意：只要不重装，这个 `/data/app/~~hash==/…-hash==/` 路径是**稳定**的）。
+
+验证命令（shell 侧即可，`/dev/mali0` 是 0666，任何 uid 都能开）：
+
+```bash
+VK_ICD_FILENAMES=/storage/emulated/0/mali-icd/panvk_icd.json ./vkprobe <插件lib目录>/libvulkan_freedreno.so
+# →  deviceName : Mali-G720 MC12      ← 我们的 PanVK
+#    apiVersion : 1.4.363
+#    driverVersion : 26.2.24.3
+```
+
+### 实测（本机 OPPO PHZ110 / 天玑9300 / Immortalis-G720 MC12 / Android 16）
+
+| 检查 | 结果 |
+|---|---|
+| 我们的 PanVK dlopen（从 `/data/local/tmp`）| ✅ ICD 形态：`vk_icdNegotiateLoaderICDInterfaceVersion` / `vk_icdGetInstanceProcAddr` / `HMI` 全有 |
+| 从 `/storage/...` dlopen | ❌ Permission denied（noexec）|
+| 从插件 `nativeLibraryDir` dlopen | ✅ **`deviceName: Mali-G720 MC12`**，API 1.4.363，扩展 181 个 |
+| MobileGL `Direct (Vulkan)` 后端（跑厂商 blob）| ✅ 26.3 进游戏，**FPS 59–60** |
