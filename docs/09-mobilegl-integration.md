@@ -290,3 +290,43 @@ volk 字样: 0 / 内嵌 loader: 无
 | `VK_ICD_FILENAMES` 注入链路 | ✅ 环境变量确实进到了游戏进程 |
 | 我们的 PanVK 作为 ICD | ✅ `Mali-G720 MC12`（独立探针验证）|
 | 让 MGL 用上它 | ❌ 被 Android loader 挡住（见 ① ②），需改 MGL 源码（见 ③）|
+
+---
+
+## 10. 为什么"垫片"路线不现实 + 下一步诊断
+
+把 `libMobileGL.so` 的 `DT_NEEDED` 从 `libvulkan.so` 换成我们的驱动（`patchelf --replace-needed`）看似优雅，
+但**行不通**，因为两边 ABI 角色不同：
+
+| | 导出 | 谁调用 |
+|---|---|---|
+| 系统 `libvulkan.so`（loader）| **125 个** loader 风格入口 | MGL 链接期直接引用 |
+| 我们的 `libvulkan_freedreno.so`（ICD）| 只有 `vk_icdGetInstanceProcAddr` / `vk_icdNegotiateLoaderICDInterfaceVersion` | loader 通过 `vk_icd*` 调用 |
+
+实测（`readelf -sW --dyn-syms`）：
+
+```
+libMobileGL.so 未定义(UND)的 vk* 符号: 125 个
+  vkCreateInstance, vkGetInstanceProcAddr, vkCreateDevice, vkAllocateMemory, vkCmdDraw, …
+我们驱动导出的: vk_icdGetInstanceProcAddr ✔ | vk_icdNegotiateLoaderICDInterfaceVersion ✔
+                vkCreateInstance ✘ | vkGetInstanceProcAddr ✘ | vkCreateDevice ✘
+```
+
+⇒ 要么写一个转发 **125 个**入口的垫片（不现实），要么让**系统 loader 真的去加载我们的 ICD**。
+
+### 下一步：让 loader 自己说为什么没加载我们的 ICD
+
+Android 的 loader **是否**忽略 `VK_ICD_FILENAMES` 还没有直接证据（我们的现象只是"最终用了 blob"）。
+让 loader 打印它的搜索与加载过程即可确诊：
+
+```
+# 在插件的 pojavEnv 里追加：
+VK_LOADER_DEBUG=all
+# 然后读 logcat：
+logcat -d | grep -iE "vk_icd|VK_ICD|ICD .*(load|found|skip)|libvulkan"
+```
+
+可能的结果与对策：
+- 若打印 `ICD … not found / skipped` → 是**路径/权限/ABI** 问题，可对症修（例如路径不可执行、缺依赖）；
+- 若**完全没提** `VK_ICD_FILENAMES` → 确认是 AOSP 的 loader 安全限制，只能回到"改 MGL 源码直接 dlopen 驱动"；
+- 若打印 `loading … ok` 但最终仍选 blob → 是 **loader 内部策略**（如只信任 vendor 目录），需查该 ROM 的 loader 实现。
