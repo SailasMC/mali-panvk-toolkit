@@ -216,3 +216,77 @@ VK_ICD_FILENAMES=/storage/emulated/0/mali-icd/panvk_icd.json ./vkprobe <插件li
 | 从 `/storage/...` dlopen | ❌ Permission denied（noexec）|
 | 从插件 `nativeLibraryDir` dlopen | ✅ **`deviceName: Mali-G720 MC12`**，API 1.4.363，扩展 181 个 |
 | MobileGL `Direct (Vulkan)` 后端（跑厂商 blob）| ✅ 26.3 进游戏，**FPS 59–60** |
+
+---
+
+## 9. ★★ 两个关键负面结论（2026-10-05 实测）
+
+把 PanVK 真正接进 MobileGL 的两次尝试都**失败**了，但原因非常明确、可复用：
+
+### ① Android 的系统 `libvulkan.so` **忽略** `VK_ICD_FILENAMES`
+
+实测（ZL2 26.3 启动日志），环境变量**确实注入成功**了：
+
+```
+▷ Renderer: MobileGL Magma + PanVK
+▷ MOBILEGL_BACKEND_TYPE = DirectVulkan
+▷ VK_ICD_FILENAMES = /storage/emulated/0/mali-icd/panvk_icd.json     ← 已生效 ✓
+[06:38:16] Using graphics backend OpenGL, using drivers: 4.6.0 MobileGL 26.09-dev, Direct (Vulkan) Backend
+```
+但同一次运行里 Vulkan 设备名依然是 **`Mali-G720-Immortalis MC12`**（厂商 blob）✗。
+
+对 `libMobileGL.so` 做字符串分析：
+
+```
+VK_ICD_FILENAMES          ← 它认得这个变量 ✓
+dlopen: libvulkan.so / libvulkan.so.1     ← 走的是系统 loader
+volk 字样: 0 / 内嵌 loader: 无
+```
+
+**⇒ 它走系统 loader，而 AOSP 的 Vulkan loader 出于安全不开放在进程里改 ICD 路径**
+（`/vendor/etc/vulkan/icd.d` 是它唯一认的入口，且只读）。所以 `VK_ICD_FILENAMES`
+在桌面上好用、**在 Android 上不可依赖**。
+
+### ② 用 `libvulkan.so.1` 顶替 loader 会**卡死 App**
+
+思路：插件 nativeLibraryDir 在 linker 搜索路径靠前，把我们的 `libvulkan.so.1` 放进去，
+让 MGL 的 `dlopen("libvulkan.so.1")` 命中它。**结果**：
+
+```
+[INFO]  SDL_Hook: Successfully initialized SDL hooks …
+[DEBUG] Found JLI lib
+[DEBUG] Calling JLI_Launch          ← 之后 6 分钟无输出，JVM 卡死 ✗
+```
+
+**⇒ 这个替换是进程级的**：JVM/LWJGL 进程里**所有** `libvulkan.so.1` 的解析都被改掉了，
+初始化直接挂住。**别这么做。**
+
+（回滚：`versionCode` 必须**递增**，降级安装会被 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒绝——
+所以回滚也要重新签一个更高 versionCode 的包。）
+
+### ③ 那正确的路是什么？
+
+不要让 MGL 走 loader，**让 MGL 直接 dlopen 我们的驱动**：
+
+- MGL 是开源且**已有 `VK_ICD_FILENAMES` 字符串**，说明它内部有一层薄封装；
+- 最小改动方案：在 MGL 的 Vulkan 初始化处，优先 `dlopen("<插件自身目录>/libvulkan_freedreno.so")`
+  并用 `vk_icdGetInstanceProcAddr` 取入口（ICD 可直接当"loader"用 ✓ 本仓库探针已验证这一点）；
+- 插件自身目录可用 `dladdr()` 在运行时求得，无需硬编码。
+
+**前提已验证** ✓：我们的 PanVK 作为 ICD 形态可加载可初始化：
+
+```
+✔ dlopen 成功（从 /data/local/tmp 与插件 nativeLibraryDir 均可）
+✔ vk_icdNegotiateLoaderICDInterfaceVersion / vk_icdGetInstanceProcAddr / HMI 齐全
+  deviceName : Mali-G720 MC12      apiVersion : 1.4.363     扩展 181 个
+```
+
+### ④ 这轮得到的**可用成果**（已生效）
+
+| 项 | 状态 |
+|---|---|
+| MobileGL `Direct (Vulkan)` 后端在 G720 上跑 26.3 | ✅ **FPS 59–60** |
+| 我们的插件被 ZL2 正确识别与选中 | ✅ `▷ Renderer: MobileGL Magma + PanVK` |
+| `VK_ICD_FILENAMES` 注入链路 | ✅ 环境变量确实进到了游戏进程 |
+| 我们的 PanVK 作为 ICD | ✅ `Mali-G720 MC12`（独立探针验证）|
+| 让 MGL 用上它 | ❌ 被 Android loader 挡住（见 ① ②），需改 MGL 源码（见 ③）|
