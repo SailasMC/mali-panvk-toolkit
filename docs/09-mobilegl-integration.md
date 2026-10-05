@@ -759,3 +759,47 @@ grep -a "OpenGL Renderer" \
 1. 用 shim 打印**完整的 `VkPhysicalDeviceFeatures` 逐位值**，与 panvk 的支持表对比，找出被虚假置位的位；
 2. 或在 shim 里**对 `vkGetPhysicalDeviceFeatures` 加"仅走 pdpa"的强约束**并复测；
 3. 或写一个独立小探针，用我们的 ICD 分别以"只带 feature 子集"的方式反复 `vkCreateDevice`，二分出被拒的 feature。
+
+---
+
+## 19. 🎯 根因链闭合（Mesa 源码级证据）
+
+### 关键源码
+```c
+/* src/panfrost/vulkan/panvk_vX_device.c:376 —— 创建队列时 */
+switch (create_info->queueFamilyIndex) {
+case PANVK_QUEUE_FAMILY_GPU:  return panvk_per_arch(create_gpu_queue)(...);   /* ✓ */
+case PANVK_QUEUE_FAMILY_BIND: return panvk_create_bind_queue(...);            /* ✓ */
+default:                      return panvk_error(dev, VK_ERROR_INITIALIZATION_FAILED);  /* ← -3 */
+}
+```
+（另一处：`panvk_physical_device.c:1408` 里 `VkResult result = VK_ERROR_INITIALIZATION_FAILED;`
+是 arch 分派的**初值** —— 若 arch 分派没覆盖它，也会原样返回 -3。）
+
+### 与真机日志交叉验证
+MGL 早先的日志里明确写着：
+```
+[WARN] No graphics queue found on physical device. Picking a device that doesn't do graphics?
+[FATAL] vkCreateDevice  →  VK_ERROR_INITIALIZATION_FAILED (-3)
+```
+⇒ **`-3` 的真身 = MGL 请求的队列族不是 GPU/BIND** ✓
+⇒ 而"看不到图形队列"的根因，是 **`vkGetPhysicalDeviceQueueFamilyProperties`** 这类**物理设备级**查询
+之前走了 instance GIPA，被返回了**错的函数指针**（早先 `apiVersion=540.1018.2112`、
+`viewport limit=1852401253`、`timestampPeriod≈2.7e26` 这些垃圾值就是同一现象）。
+
+### 因此修法链条是自洽的
+| 修法 | 作用 |
+|---|---|
+| `gipa_pd()` **物理设备级优先**（v39）| 让 `vkGetPhysicalDeviceQueueFamilyProperties` / `…Features` / `…Properties` 拿到**正确**函数 ⇒ MGL 能看到图形队列与真实 feature |
+| **123 项 thunk 表**（v36）| `vkGet*ProcAddr` 只返回自家 thunk ⇒ 句柄域统一、日志可观测 |
+| **feature 屏蔽**（v41）| 建设备前 AND 掉驱动不支持的位 ⇒ 避免投机性提交被拒 |
+| 日志双写 `/sdcard/MG/vkshim.log`（v38）| 不受 logcat 环形缓冲影响，能拿到 `vkCreateDevice` 入参 |
+
+⇒ **v41 / 4.1-featmask（sha256 `acf64880`）已装设备**，从源码看三处都已对症；
+剩下只差一次真机运行来读判据行。
+
+### 若仍失败，按此定位
+`/sdcard/MG/vkshim.log` 里 `feature mask applied, masked-out bits=0x…` 与 `feat[i] … xor=0x…`
+会直接给出发散位；若 `xor` 全 0 且仍然 -3，则问题在**队列族**侧：
+打印 `vkGetPhysicalDeviceQueueFamilyProperties` 的返回值（族数、每族的 queueFlags），
+确认 `VK_QUEUE_GRAPHICS_BIT` 是否出现在返回值里。
