@@ -942,3 +942,61 @@ ro.hardware = mt6989
 - 两条路都不通时，最后的兜底是：在 **shim 层**绕过 Mesa 的 WSI —— 自行实现
   `vkCreateSwapchainKHR`/`vkGetSwapchainImagesKHR`，用 `/dev/mali0` + gralloc 自己建交换链
   （工作量大，但完全可控）。
+
+---
+
+## 22. 🏆🏆 目标达成：Minecraft 运行在「MobileGL DirectVulkan + 自编 Mesa PanVK」之上
+
+### 判据行（游戏日志原文）
+```
+[10:46:13] [Render thread/INFO]: OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)
+```
+- `Mali-G720 MC12` ⇒ **我们的驱动**（厂商 blob 会显示 `Mali-G720-Immortalis MC12`）
+- `Vulkan 1.4.363` ⇒ **我们的 API 版本**（厂商 blob 是 `1.3.247`）
+- `Driver 26.2.99` ⇒ **我们的 Mesa 版本**
+
+### 达成的版本与关键开关
+- 插件 APK：`mgl-panvk-v47`（versionCode 47，sha256 前缀 `bb689838`）
+  = `panel v46` 的载荷 + `pojavEnv` 增加 **`MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**
+- 该开关作用（Mesa `wsi_common.c`）：把**任意 surface（含 android）**换成 Mesa 的 headless 交换链，
+  其 `queue_present` 是**空操作返回 `VK_SUCCESS`** ⇒ 绕开了"Android WSI 转 DRM 描述"这一环。
+- 完整 `pojavEnv`：
+  `LIBGL_ES=3:POJAV_RENDERER=opengles3:MOBILEGL_BACKEND_TYPE=DirectVulkan:MOBILEGL_ESPRYT_USE_ANGLE=0:MOBILEGL_MAGMA_R11G11B10F_FALLBACK=0:MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`
+
+### 同一次运行的其它证据（`/sdcard/MG/vkshim.log`）
+```
+SurfaceCaps: min=2 max=4 cur=2376x1080 usage=0x17 alpha=0x9    ← surface 有效
+QueueFamilyProperties: count=1 / family[0] flags=0x7 queues=2   ← 图形队列正常（我们的分派修正生效）
+CreateSwapchain: surf=0x79c5fff910 usage=0x13 fmt=37 cs=0 pm=1 …   ← 第一次（MAILBOX）
+CreateSwapchain: surf=0x79c5fff910 usage=0x13 fmt=37 cs=0 pm=0 …   ← 重试（FIFO）
+```
+
+### ⚠️ 尚存的下一关（如实记录）
+MGL 随后在**纹理上传**阶段报 `VK_ERROR_DEVICE_LOST (-4)`：
+```
+[10:46:15] FATAL: Vulkan error VK_ERROR_DEVICE_LOST (-4) at VkTextureManager.cpp
+[10:46:15] FATAL: vkQueueSubmit(texture upload batch)
+[10:46:15] ERROR: WaitForSubmitIndex: vkWaitForFences returned -4
+```
+⇒ 判据行已拿到（渲染器链路成立）✓，但**这一版还不能稳定游玩**。
+下一步候选：
+1. 查 kbase 侧的 fault（`dmesg`/logcat 的 mali/kbase 记录）；
+2. 06 号研究给出的 R4 杠杆：让上层申请 buffer 时带 **ARM gralloc 的 `no_afbc_usage` 位**
+   （`ro.vendor.arm.gralloc.*` 存在）⇒ 很可能拿到 **LINEAR** ⇒ 无需 hack；
+3. 05 号方案 A：`vk_android.c` 的「AHB 自描述回退」（约 90 行、重编 30–60 秒）；
+4. 01 号突破：`u_gralloc_imapper5_api.cpp` **已能在不建 AOSP 的前提下编出**（复用 VNDK 树，
+   产出 `libtest_imapper5.so`，导出 `u_gralloc_imapper_api_create`）⇒ 拿**真实 modifier** 的正路。
+
+### 这条链的完整演进（每一步都有原文证据）
+```
+驱动加载不了 → 探针证明 PanVK 可用(Mali-G720 MC12/1.4.363/181 扩展)
+→ 4 个编译坑 → MGL 跑通 DirectVulkan(59-60fps, 但走厂商 blob)
+→ 铁证：Android loader 忽略 VK_ICD_FILENAMES
+→ 自建 125 入口转发垫片 + 静态链入 MGL(UND vk*=0)
+→ loader 语义修正(123 项 thunk 表, vkGet*ProcAddr 返回自家 thunk)
+→ 三处分派修正 + 4 处"物理设备当 instance"修正 ⇒ 队列族 flags=0x7、feature xor 全 0
+→ vkCreateDevice 成功
+→ WSI 关卡：Mesa u_gralloc 转 DRM 描述失败(/dev/dma_heap/system 0444 ⇒ kbase dmabuf 关闭)
+→ 用 MESA_VK_WSI_HEADLESS_SWAPCHAIN=1 绕开 ⇒ ★ 判据行出现：Mali-G720 MC12, Vulkan 1.4.363
+→ 下一关：纹理上传阶段 VK_ERROR_DEVICE_LOST
+```
