@@ -803,3 +803,78 @@ MGL 早先的日志里明确写着：
 会直接给出发散位；若 `xor` 全 0 且仍然 -3，则问题在**队列族**侧：
 打印 `vkGetPhysicalDeviceQueueFamilyProperties` 的返回值（族数、每族的 queueFlags），
 确认 `VK_QUEUE_GRAPHICS_BIT` 是否出现在返回值里。
+
+---
+
+## 20. 🎉 突破：`vkCreateDevice` 成功，错误推进到交换链（WSI / gralloc）
+
+### 20.1 A/B 二分：现场日志直接指认转发层的 bug
+
+在 shim 里打印"经 `gipa_pd` 解析的指针"与"直接问 instance GIPA 的指针"，一次运行即定论：
+
+```
+QFam-diag: fn=0x0  viaInstanceGIPA=0x79bad17d28  pdpa=0x79bad793b0  gipa=0x79ba9c4d0c  g_inst=0x7b6cf91680
+           ↑ NULL ✗   ↑ 有效 ✓    ⇒ 结论：转发层取指针取空了，驱动没问题
+QueueFamilyProperties: count=0      ← 因为 fn=NULL，转发器跳过调用，count 保持 0
+```
+
+**根因**：生成器把"首参含 `VkPhysicalDevice`"的函数误判成设备级（`VkPhysicalDevice` 里含子串 `VkDevice`），
+于是它们走 `gp_inst(physicalDevice, …)` —— **把物理设备当成 instance 传给 ICD 的 GIPA**，查表必然落空。
+
+修正（4 处）：
+```c
+/* 之前 */ PFN_vkX fn=(PFN_vkX)gp_inst(physicalDevice,"vkX");
+/* 之后 */ PFN_vkX fn=(PFN_vkX)gipa_pd(physicalDevice,"vkX");   /* 先 pdpa，再退回【真实 instance】 */
+```
+
+### 20.2 修正后的实测结果（质的飞跃）
+
+```
+SurfaceCaps: min=2 max=4 cur=2376x1080 usage=0x17 alpha=0x9        ← surface 完全有效
+QueueFamilyProperties: count=1
+  family[0] flags=0x7 queues=2                                     ← GRAPHICS|COMPUTE|TRANSFER ✓
+vkCreateDevice: feature mask applied, masked-out bits=0x00000000
+  feat[0] want=0x1 sup=0x1 xor=0x0 …                               ← 请求位 == 支持位，零分歧
+vkCreateDevice → 成功（MGL 日志中不再出现 vkCreateDevice FATAL）
+```
+
+### 20.3 当前唯一剩余问题：WSI 的 gralloc 转换
+
+MGL 传的交换链参数**全部合法**（实测）：
+```
+CreateSwapchain: surf=0x7b8b3f9690 usage=0x13 fmt=37 cs=0 pm=1 alpha=0x1 layers=1 old=0x0
+                 usage=0x13 ⊆ caps 0x17 ✓  fmt=37 ✓  pm=1(MAILBOX) ✓  图像数 3 ∈ [2,4] ✓
+```
+但仍返回 `VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)`。源码定位到**一行**：
+
+```c
+/* Mesa: src/vulkan/runtime/vk_android.c —— AHB → DRM format modifier 助手 */
+struct u_gralloc *u_gralloc = vk_android_get_ugralloc();
+if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
+   return VK_ERROR_INVALID_EXTERNAL_HANDLE;          /* ← 就是这里 */
+```
+
+**与项目开头的老结论闭环**：本机 `/dev/dri/*` 全部 `EACCES`（DRM 路线不可用），
+而 Mesa `u_gralloc` 的默认后端正是走 `/dev/dri` 的 "dri" 后端 ⇒ 必然失败 ⇒ 该返回值与实测数字完全一致。
+
+**修法方向**：让 panvk 使用 Mesa 的 **Android gralloc 后端**（`u_gralloc_android`：经 `libgrallocmapper`/gralloc AIDL，不依赖 `/dev/dri`），
+即检查我们这份 panvk 构建是否编入了该后端；若未编入则打开对应 meson 选项重编驱动，重打插件后再测。
+
+### 20.4 本轮新增的落盘诊断（都在 `/sdcard/MG/vkshim.log`，不受 logcat 环形缓冲影响）
+| 版本 | 新增诊断 |
+|---|---|
+| v38 | `FLOG` 双写 logcat + `/sdcard/MG/vkshim.log` |
+| v40 | `feat[i] want/sup/xor`（6 字 = 192 个 feature 位逐位对比） |
+| v41 | 建 device 前**屏蔽驱动不支持的 feature 位**并打印 `masked-out bits` |
+| v42 | `QueueFamilyProperties: count / family[i] flags,queues` |
+| v43 | `QFam-diag: fn / viaInstanceGIPA / pdpa / gipa / g_inst`（A/B 二分用） |
+| v46 | `SurfaceCaps: …` 与 `CreateSwapchain: surf/usage/fmt/pm/alpha/layers/old` |
+
+### 20.5 错误点迁移史（每一步都是净进步）
+```
+① libvulkan_freedreno.so wsi_GetSwapchainImagesKHR+0x20   驱动 WSI 段错
+② libMobileGL.so+0x961380                                  MGL 内 NULL 函数调用
+③ vkCreateDevice = -3                                      队列族 count=0（转发层取指针失败）
+④ vkCreateDevice 成功、队列族 flags=0x7、feature xor 全 0   ✓✓
+⑤ 交换链：VK_ERROR_INVALID_EXTERNAL_HANDLE                 u_gralloc(/dev/dri) 转换失败 ← 当前
+```
