@@ -878,3 +878,67 @@ if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
 ④ vkCreateDevice 成功、队列族 flags=0x7、feature xor 全 0   ✓✓
 ⑤ 交换链：VK_ERROR_INVALID_EXTERNAL_HANDLE                 u_gralloc(/dev/dri) 转换失败 ← 当前
 ```
+
+---
+
+## 21. WSI 唯一剩余问题：Mesa `u_gralloc` 后端（路线与判定）
+
+### 21.1 实测证据（v46 运行）
+MGL 传的交换链参数全部合法，仍返回 `VK_ERROR_INVALID_EXTERNAL_HANDLE`：
+```
+SurfaceCaps: min=2 max=4 cur=2376x1080 usage=0x17 alpha=0x9
+CreateSwapchain: surf=0x7b8b3f9690 usage=0x13 fmt=37 cs=0 pm=1 alpha=0x1 layers=1 old=0x0
+```
+源码定位：`src/vulkan/runtime/vk_android.c`
+```c
+if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
+   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+```
+
+### 21.2 为什么我们的 panvk 会失败（源码级判定）
+`u_gralloc.c` 的后端尝试顺序：
+```
+CROS → [GRALLOC4 若编入] → LIBDRM → QCOM → FALLBACK
+```
+- 我们**没有**编入 GRALLOC4（构建时 `dependency('android.hardware.graphics.mapper')` 未找到）：
+  `strings libvulkan_panfrost.so` 里 `android.hardware.graphics.mapper` 计数为 **0** ✓
+- `LIBDRM` 后端**必然失败**：`u_gralloc_libdrm_create()` 要求 `hw_get_module("gralloc")`
+  返回的模块名严格等于 **"gbm"**，本机 `gralloc.default.so` 不是 gbm 模块 ⇒ `goto fail` ✓
+- `QCOM` 后端是高通专用 ⇒ 失败 ✓
+- ⇒ 实际落到 **FALLBACK**，它靠 `hw_get_module(GRALLOC_HARDWARE_MODULE_ID)`
+  拿到 `/vendor/lib64/hw/gralloc.default.so` —— 但 Android 16 上它只是**空壳**，
+  `get_buffer_basic_info` 返回非 0 ⇒ 报 `VK_ERROR_INVALID_EXTERNAL_HANDLE` ✓
+  **⇒ 路线 A（换运行时后端）被排除；必须把 GRALLOC4(imapper4) 后端编进去。**
+
+### 21.3 路线 B 的准确技术要求（已摸清）
+`u_gralloc_imapper4_api.cpp` 依赖：
+```
+aidl/android/hardware/graphics/common/{BufferUsage,ChromaSiting,Dataspace,ExtendableType,
+     PlaneLayoutComponent,PlaneLayoutComponentType}.h     ← AOSP hardware/interfaces（源码可拉）
+gralloctypes/Gralloc4.h                                   ← AOSP system/core/libgralloctypes
+system/window.h                                           ← NDK 自带 ✓
+android::hardware::graphics::mapper::V4_0::IMapper        ← 经 Gralloc4.h 传递的 HIDL 4.0 头
+```
+Meson 探测方式（**可用手写 pkg-config 满足**）：
+```meson
+dep_android_mapper4 = dependency('android.hardware.graphics.mapper', version:'>= 4.0', required:false)
+```
+设备侧已具备运行时库（实测存在）：
+```
+/vendor/lib64/hw/gralloc.default.so
+android.hardware.graphics.mapper@2.0/2.1/3.0/4.0.so
+libgralloctypes.so · libgralloctypes_mtk.so · libgralloc_extra.so · libgralloc_metadata.so
+ro.hardware = mt6989
+```
+⇒ 步骤：① 拉 AOSP 头（libgralloctypes + mapper 4.0 HIDL + graphics/common aidl）
+② 写 `android.hardware.graphics.mapper.pc` 指向头目录与（链接用的）设备库/stub
+③ 重 configure Mesa 构建目录 ⇒ `USE_IMAPPER4_METADATA_API` 自动打开
+④ 重编 `libvulkan_panfrost.so` → 重打插件 APK → 装机实测
+
+### 21.4 风险与备选
+- HIDL 4.0 头通常是 `hidl-gen` **生成**的，AOSP 源码树里未必直接存在；
+  若拉不到，备选是改用 `u_gralloc_imapper5_api.cpp`（AIDL 路线，头文件都是源码形式），
+  它由 `dep_android_ui = dependency('ui', …)` 触发。
+- 两条路都不通时，最后的兜底是：在 **shim 层**绕过 Mesa 的 WSI —— 自行实现
+  `vkCreateSwapchainKHR`/`vkGetSwapchainImagesKHR`，用 `/dev/mali0` + gralloc 自己建交换链
+  （工作量大，但完全可控）。
