@@ -14,7 +14,7 @@
 
 ---
 
-## 1. 正文（10 篇，服务器 `/root/research/` 原样收录）
+## 1. 正文（12 篇，服务器 `/root/research/` 原样收录）
 
 | # | 文件 | 标题 | 一句话主题 | 结论要点 | 状态 |
 |---|---|---|---|---|---|
@@ -22,12 +22,14 @@
 | 02 | [`02-hidl-route.md`](02-hidl-route.md) | HIDL（imapper4）路线可行性 | HIDL 4.0 生成头的获取/生成路径与链接依赖 | **可行且便宜**（0.5–1.5 人天）；`prebuilts/vndk` v29–v34 预生成了 HIDL 头（**v35/v36 不存在**，本机 `ro.vndk.version=34` 正好吻合）；`hidl-gen` 有预编译二进制，2 个 curl 即可跑；唯一真坑是 libc++ `std::__1` vs `std::__ndk1`，修法确定 | ✅ 已实测编译+链接 |
 | 03 | [`03-libgralloctypes.md`](03-libgralloctypes.md) | libgralloctypes 能力边界 | NDK `AHardwareBuffer` 能否完全替代 gralloc/IMapper | **不能**：decode 系列是纯函数，但字节流唯一来源是 IMapper@4.0 HIDL 的跨进程 `get()`；**NDK/VNDK/libui 全都没有返回 DRM modifier 的 API**；纯 NDK 连 dma-buf fd 都拿不到 | ✅ 已定论（负面） |
 | 04 | [`04-mesa-ugralloc.md`](04-mesa-ugralloc.md) | Mesa `u_gralloc` 精读 | ops 契约 / 6 个后端 / `vk_android.c` 调用点 | 本机**既有 5 个后端全部不可用**（CROS/LIBDRM/QCOM 靠模块名精确匹配、imapper4/5 在 `-Dandroid-stub=true` 下**根本没编**、FALLBACK 只给 `DRM_FORMAT_MOD_INVALID` ⇒ panvk 里 NULL 解引用）⇒ **必须新增后端** | ✅ 已定论 |
-| 05 | [`05-bypass-patch.md`](05-bypass-patch.md) | 绕开 `u_gralloc` 的最小补丁 | 方案 A：`vk_android.c` 的「AHB 自描述回退」 | 只改 **1 个文件约 90–105 行**、无需 meson 改动、严格加性（仅在前述调用失败时生效）；重编约 30–60 秒；**成功率估计 70–80%** | ✅ 方案成文，**未上机** |
+| 05 | [`05-bypass-patch.md`](05-bypass-patch.md) | 绕开 `u_gralloc` 的最小补丁 | 方案 A：`vk_android.c` 的「AHB 自描述回退」 | 只改 **1 个文件约 90–105 行**、无需 meson 改动、严格加性（仅在前述调用失败时生效）；重编约 30–60 秒；**成功率估计 70–80%** | ✅ **已实施并编入 v50**（⚠️ v50 未上机） |
 | 06 | [`06-panvk-wsi.md`](06-panvk-wsi.md) | PanVK Android WSI 深挖 | `panvk_wsi.c` 全链依赖与错误返回点 | ★ **决定性事实**：`/dev/dma_heap/system` 权限 **0444** ⇒ `kbase_kmod.c` 用 `O_RDWR` 打开失败 ⇒ `kbase_kmod_supports_dmabuf()=false` ⇒ panvk 落 `sw_device=true`、`supports_modifiers=false` ⇒ DRI3/raw-fd 一行都没走到；与 u_gralloc 失败是**同一根因链** | ✅ 已定论 |
 | 07 | [`07-mobilegl-wsi.md`](07-mobilegl-wsi.md) | MobileGL 侧能否绕开交换链 | 离屏渲染 / env 全清单 / 只改 MGL 的可行性 | **不存在"只改配置就出画面"的路**（默认 FBO 物理上就是交换链图像，无 blit）；但 ★ **一行杀招** `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1` 可把"WSI 建链失败→崩"降级为"干净跑完→黑屏"，用于**判定坏的只有 WSI** | ✅ 已定论（并已被采用） |
 | 08 | [`08-zl2-surface.md`](08-zl2-surface.md) | ZL2 如何把 Surface 交给渲染器 | SDL / EGLBridge / SurfaceView 链与可配置项 | 用哪个桥**完全由 `POJAV_RENDERER` 字符串决定**；`custom_gallium`/`gallium_panfrost` ⇒ OSMesa 桥，**一次都不调 `vkCreateSwapchainKHR`**；代价是**每帧 CPU 合成**；`boatEnv` 在 ZL2 全树 0 命中 | ✅ 已定论 |
 | 09 | [`09-precedents.md`](09-precedents.md) | 真实世界先例 | `VK_ERROR_INVALID_EXTERNAL_HANDLE` / `u_gralloc` 的公开案例与补丁 | 汇总上游/社区的同类问题与处理方式，作为本仓库补丁方向的旁证 | ⚠️ 无中文摘要（见 §3 缺口） |
-| 10 | [`10-verify-probe.md`](10-verify-probe.md) | 验证方案与独立探针 | 可编译的最小 WSI 探针 + 兜底验证路径 | 交付 7 模式探针工程 `probe10/`（`panvk_wsi_probe.c` 1394 行，**已编译通过**，**未在真机运行**）；把卡点**精确化**到 `vkCreateSwapchainKHR` 第 4 步的 `u_gralloc_get_buffer_basic_info()` | ✅ 已编译，⏳ 未上机 |
+| 10 | [`10-verify-probe.md`](10-verify-probe.md) | 验证方案与独立探针 | 可编译的最小 WSI 探针 + 兜底验证路径 | 交付 7 模式探针工程 `probe10/`（`panvk_wsi_probe.c`）；把卡点**精确化**到 `vkCreateSwapchainKHR` 第 4 步的 `u_gralloc_get_buffer_basic_info()` | ✅ 已编译，**已上机（8 模式，见 12）** |
+| 11 | [`11-wsi-patch-implementation.md`](11-wsi-patch-implementation.md) | WSI 补丁实施（v50） | 05 方案 A + MR !43659 式 LINEAR 推断的落地与验证 | 3 个文件**严格加性**改动（`u_gralloc_fallback.c` 的 `-EINVAL→-EAGAIN`、新增 `panvk_infer_linear_modifier()`、`vk_android.c` 的 AHB 自描述回退约 150 行、`nativewindow_stub.cpp` 的 `lockPlanes` 桩）；①a 对 WSI 自身 AHB **不生效**（`format=1` 不是 YUV）⇒ 放行交换链的是 ①b；新 `.so` md5 `e08e0764…`/20,005,320 B；★ **构建目录实测判定**：只有 `build/android-v4` 有产物、`wsi_x11` 计数 0、`platforms=['android']` ⇒ **`research/06` 的"出厂件含 x11 WSI"不成立**（闭合 U4）；附三份 diff 原文 | ✅ 已实施+静态验证，⚠️ **v50 未上机** |
+| 12 | [`12-probe-run-results.md`](12-probe-run-results.md) | 真机探针 8 模式结果 | 逐步 `VkResult` 钉死卡点 | ★★ **驱动渲染被独立证明**（`render` 无 surface/无 root、`failures=0`、像素 `64/128/191/255` 三点精确）；**原假设不能复现**（`win`/`headless`/`winimpdef` 三路 `vkCreateSwapchainKHR` 全 `VK_SUCCESS`）；唯一可复现的 `-1000072003` 只在 AHB `IMPLEMENTATION_DEFINED(0x22)`；★ **`-4` 的真身 = kbase CSF fatal exception `0xc3`**（`tri`：`vkQueueSubmit→0` 但 `vkWaitForFences=-4`），不含 draw 的 clear+copy 全正常 ⇒ **首要目标转为查 CSF `0xc3`** | ✅ 已实测（探针 md5 `f735e1f4…`，加载补丁前驱动 `4417b369…`） |
 
 ---
 
@@ -35,7 +37,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| [`paper.md`](paper.md) | **综述论文**：摘要 / 引言 / 系统与设备背景 / 方法 / 失败点分析与修复（5 次错误点迁移）/ 证据 / 讨论（三条路线对比）/ 结论与后续工作 / 附录 |
+| [`paper.md`](paper.md) | **综述论文**：摘要 / 引言 / 系统与设备背景 / 方法 / 失败点分析与修复（**6 次**错误点迁移）/ 证据 / 讨论（三条路线对比 + **"WSI 不是最终瓶颈，CSF 绘制执行才是"**）/ 结论与后续工作 / 附录 |
 | [`00-paper-skeleton.md`](00-paper-skeleton.md) | 骨架（写作过程记录，`paper.md` 的前身） |
 
 ---
@@ -49,18 +51,22 @@
 | [`summaries/03-结论摘要.md`](summaries/03-结论摘要.md) | 03 | 纯 NDK 无法绕开 gralloc；**缺口核心就是 modifier** |
 | [`summaries/04-结论摘要与行动计划.md`](summaries/04-结论摘要与行动计划.md) | 04 | 现有 5 个后端全部不可用 + 新后端 ops 契约 + 直连 mapper AIDL 的方案 |
 | [`summaries/05-07-08-关键结论.md`](summaries/05-07-08-关键结论.md) | 05 / 07 / 08 | 决策依据：**三条路线选择表**（A 修 WSI 推荐 / B 切 gallium 桥 / C shim 层绕过） |
-| [`summaries/06-结论摘要与决定性事实.md`](summaries/06-结论摘要与决定性事实.md) | 06 | ★ `/dev/dma_heap/system` 0444 这条根因；路线 R1–R5 排名；05 与 06 之间一处**未解矛盾** |
-| [`summaries/10-结论摘要-可上机探针.md`](summaries/10-结论摘要-可上机探针.md) | 10 | 7 模式探针清单 + 判据（logcat tag `MESA`）+ 先 render、再 ahb/mapper、再 headless、最后 win 的顺序 |
+| [`summaries/06-结论摘要与决定性事实.md`](summaries/06-结论摘要与决定性事实.md) | 06 | ★ `/dev/dma_heap/system` 0444 这条根因；路线 R1–R5 排名；05 与 06 之间一处**未解矛盾**（该矛盾**已闭合**，见 [`11-wsi-patch-implementation.md`](11-wsi-patch-implementation.md) §1） |
+| [`summaries/09-结论摘要.md`](summaries/09-结论摘要.md) | 09 | ★ 真实世界先例：**上游没有"不依赖 gralloc 的 WSI"**；`-EINVAL→-EAGAIN` 一行修复 + !43659 式 LINEAR 推断；Mali 生态公认解 = **自分配 + blit**；mapper AIDL/stable-C 在应用态**无成功先例** |
+| [`summaries/10-结论摘要-可上机探针.md`](summaries/10-结论摘要-可上机探针.md) | 10 | 7 模式探针清单 + 判据（logcat tag `MESA`）+ 先 render、再 ahb/mapper、再 headless、最后 win 的顺序 —— **已上机，结果见 [`12-probe-run-results.md`](12-probe-run-results.md)** |
 
-> **已知缺口（如实记录）**：尚未产出 07 / 08 / 09 三篇的**独立**中文摘要 ——
-> 07 与 08 的结论已并入 `05-07-08-关键结论.md`；**09（真实世界先例）目前没有中文摘要**。
+> **已知缺口（如实记录）**：07 / 08 两篇**没有独立**的中文摘要 —— 其结论已并入
+> [`summaries/05-07-08-关键结论.md`](summaries/05-07-08-关键结论.md)。
+> ~~09（真实世界先例）没有中文摘要~~ ⇒ ✅ **已补**（[`summaries/09-结论摘要.md`](summaries/09-结论摘要.md)）。
+> 11 / 12 两篇为密集报告，暂不另设摘要（正文本身已足够短到可当摘要读）。
 
 ---
 
 ## 4. 与工程实录的关系
 
 - 工程侧"实际怎么做的、踩了哪些坑、每一步的原文日志"在
-  [`../docs/09-mobilegl-integration.md`](../docs/09-mobilegl-integration.md)（共 22 节）；
+  [`../docs/09-mobilegl-integration.md`](../docs/09-mobilegl-integration.md)（共 25 节，
+  §23 = v48/v49、§24 = v50 WSI 补丁、§25 = 真机探针 8 模式）；
 - 本目录的 01–10 是**专题深化**（WSI / gralloc / 启动器契约），`paper.md` 负责把两者缝合；
 - 引用约定：**`docs/09 §N`** 指工程实录第 N 节；**`research/NN`** 指本目录第 NN 篇。
 
@@ -74,4 +80,8 @@
 驱动加载 ✓ · 扩展枚举 ✓ · `vkCreateInstance` ✓ · `vkCreateDevice` 成功 ✓ · 队列族 `flags=0x7` ✓ ·
 feature 逐位一致 ✓ · 交换链参数全部合法 ✓ ·
 **判据行已达成** ✓（原文：`OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)`）·
-**下一关** = 纹理上传阶段 `VK_ERROR_DEVICE_LOST (-4)`（`docs/09` §22）。
+**驱动渲染被独立证明** ✓（探针 `render`/`ahb`/`win` 三模式 `failures=0`）·
+**原假设"交换链建不起来"不能复现** ✓（三路 `vkCreateSwapchainKHR` 全 `VK_SUCCESS`）·
+★ **当前首要问题** = **kbase CSF fatal exception `0xc3`**（`tri`：`vkQueueSubmit` 成功但 `vkWaitForFences = -4`）
+——即 `VK_ERROR_DEVICE_LOST (-4)` 的真身，**WSI 不是最终瓶颈，CSF 绘制执行才是**
+（`docs/09` §25、[`12-probe-run-results.md`](12-probe-run-results.md)）。

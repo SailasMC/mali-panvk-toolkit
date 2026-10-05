@@ -1,0 +1,181 @@
+--- src/vulkan/runtime/vk_android.c.bak-1791169250	2026-10-05 01:25:07.100414851 +0800
++++ src/vulkan/runtime/vk_android.c	2026-10-05 11:02:51.966979035 +0800
+@@ -40,6 +40,7 @@
+ #include "util/libsync.h"
+ #include "util/log.h"
+ #include "util/os_file.h"
++#include "util/u_debug.h"
+ #include "util/u_gralloc/u_gralloc.h"
+ 
+ #include <hardware/gralloc.h>
+@@ -666,6 +667,146 @@
+    return VK_SUCCESS;
+ }
+ 
++/* ------------------------------------------------------------------------ *
++ * task-11 方案 A（研究 05 §2.4）：不依赖 u_gralloc 的 AHB 自描述回退。
++ *
++ * 严格加性：只有在 vk_gralloc_to_drm_explicit_layout() 已经失败之后才被调用，
++ * 对 gralloc 工作正常的设备零行为变化。
++ *
++ * 只接受"能证明是线性"的缓冲：
++ *   - 该 AHB 的 usage 声明了 CPU 可读/可写。Android 上 AFBC/UBWC 等压缩布局
++ *     不可被 CPU 映射，所以"声明可 CPU 访问"⇒ 只能是线性/可映射布局；
++ *   - 单 layer、单平面、公开 RGB 格式（YUV / 深度 / BLOB / RAW 一律拒绝，不猜）；
++ *   - 行距取 desc.stride（NDK 原文 "Row stride in pixels"）* bpp；stride==0 时
++ *     用 AHardwareBuffer_lockPlanes()（NDK API 29+）实测真实字节行距。
++ * panvk 对 DRM_FORMAT_MOD_INVALID 没有 handler（pan_mod_get_handler(INVALID)
++ * == NULL ⇒ 空指针），所以这里必须给出 DRM_FORMAT_MOD_LINEAR。
++ *
++ * 开关：PANVK_GRALLOC_NO_FALLBACK=1 一键回到旧行为；
++ *       PANVK_GRALLOC_ANY_USAGE=1   允许未声明 CPU usage 的 AHB（默认关闭）。
++ * ------------------------------------------------------------------------ */
++
++static bool
++vk_android_ahb_format_to_drm(uint32_t ahb_format, uint32_t *out_fourcc,
++                             uint32_t *out_bpp)
++{
++   /* AHARDWAREBUFFER_FORMAT_* 与 HAL_PIXEL_FORMAT_* 在这些历史值上同号，
++    * 映射方向与 u_gralloc_internal.c:get_fourcc_from_hal_format() 保持一致。 */
++   switch (ahb_format) {
++   case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:         /* 1    RGBA_8888 */
++      *out_fourcc = DRM_FORMAT_ABGR8888;      *out_bpp = 4; return true;
++   case AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM:         /* 2    RGBX_8888 */
++      *out_fourcc = DRM_FORMAT_XBGR8888;      *out_bpp = 4; return true;
++   case AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM:         /* 5    BGRA_8888 */
++      *out_fourcc = DRM_FORMAT_ARGB8888;      *out_bpp = 4; return true;
++   case AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM:           /* 4    RGB_565   */
++      *out_fourcc = DRM_FORMAT_RGB565;        *out_bpp = 2; return true;
++   case AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT:     /* 0x16 RGBA_FP16 */
++      *out_fourcc = DRM_FORMAT_ABGR16161616F; *out_bpp = 8; return true;
++   case AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM:      /* 0x2b RGBA1010102 */
++      *out_fourcc = DRM_FORMAT_ABGR2101010;   *out_bpp = 4; return true;
++   case AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM:           /* 3    RGB_888   */
++      *out_fourcc = DRM_FORMAT_BGR888;        *out_bpp = 3; return true;
++   case AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED: /* 0x22 见下 */
++      /* 与 u_gralloc 自己那条 "HACK: Hardcode this to RGBX_8888" 一致：
++       * 目标机上本进程申请的 IMPLEMENTATION_DEFINED 就是 RGBX_8888。
++       * （u_gralloc 的 is_hal_format_yuv() 把它误当 YUV 才导致上游失败。） */
++      *out_fourcc = DRM_FORMAT_XBGR8888;      *out_bpp = 4; return true;
++   default:
++      /* YUV / BLOB / D16..S8_UINT / RAW*：没有真实元数据就无法给出布局，拒绝。 */
++      return false;
++   }
++}
++
++/* 实测真实行距（字节）。lockPlanes 成功本身也证明该 buffer 可被 CPU 映射
++ * （⇒ 非 AFBC/压缩布局）。失败即 fail-closed，由调用方拒绝。 */
++static bool
++vk_android_ahb_probe_row_pitch(struct AHardwareBuffer *ahb, uint64_t *out_pitch)
++{
++   AHardwareBuffer_Planes planes;
++
++   if (!ahb)
++      return false;
++
++   memset(&planes, 0, sizeof(planes));
++   if (AHardwareBuffer_lockPlanes(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
++                                  -1, NULL, &planes) != 0)
++      return false;
++   AHardwareBuffer_unlock(ahb, NULL);
++
++   if (planes.planeCount < 1 || planes.planes[0].rowStride == 0)
++      return false;
++
++   *out_pitch = planes.planes[0].rowStride;   /* 字节，含 gralloc 对齐填充 */
++   return true;
++}
++
++static VkResult
++vk_android_ahb_layout_from_desc(
++   struct AHardwareBuffer *ahb, const AHardwareBuffer_Desc *desc,
++   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
++   VkSubresourceLayout *out_layouts, int max_planes)
++{
++   uint32_t fourcc, bpp;
++
++   if (max_planes < 1)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++   if (desc->layers > 1) {
++      mesa_loge("AHB layout fallback: %u layers unsupported", desc->layers);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   if (!vk_android_ahb_format_to_drm(desc->format, &fourcc, &bpp)) {
++      mesa_loge("AHB layout fallback: format 0x%x has no known linear mapping",
++                desc->format);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   if (!debug_get_bool_option("PANVK_GRALLOC_ANY_USAGE", false) &&
++       (desc->usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
++                       AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)) == 0) {
++      /* 没有声明 CPU 访问 ⇒ 无法排除压缩布局，拒绝猜（这正是 panvk 崩溃的来源）。 */
++      mesa_loge("AHB layout fallback: usage=0x%llx declares no CPU access; "
++                "cannot prove LINEAR",
++                (unsigned long long)desc->usage);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   uint64_t row_pitch = (uint64_t)desc->stride * bpp;
++   if (row_pitch == 0 &&
++       !vk_android_ahb_probe_row_pitch(ahb, &row_pitch)) {
++      mesa_loge("AHB layout fallback: stride==0 and lockPlanes probe failed; "
++                "refusing to guess a row pitch");
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   if (row_pitch < (uint64_t)desc->width * bpp) {
++      mesa_loge("AHB layout fallback: pitch %llu < width(%u)*bpp(%u)",
++                (unsigned long long)row_pitch, desc->width, bpp);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++
++   memset(out, 0, sizeof(*out));
++   memset(out_layouts, 0, sizeof(*out_layouts) * max_planes);
++
++   out->sType =
++      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
++   out->pPlaneLayouts = out_layouts;
++   out->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
++   out->drmFormatModifierPlaneCount = 1;
++   out_layouts[0].offset = 0;
++   out_layouts[0].rowPitch = row_pitch;
++   out_layouts[0].size = row_pitch * desc->height;
++
++   mesa_logi("AHB layout fallback: %ux%u fmt=0x%x fourcc=0x%08x pitch=%llu "
++             "usage=0x%llx -> DRM_FORMAT_MOD_LINEAR",
++             desc->width, desc->height, desc->format, fourcc,
++             (unsigned long long)row_pitch,
++             (unsigned long long)desc->usage);
++   return VK_SUCCESS;
++}
++
+ VkResult
+ vk_android_get_ahb_layout(
+    struct AHardwareBuffer *ahardware_buffer,
+@@ -684,8 +825,21 @@
+       .hal_format = description.format,
+    };
+ 
+-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+-                                            out_layouts, max_planes);
++   VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
++                                                       out_layouts, max_planes);
++   if (result == VK_SUCCESS)
++      return result;
++
++   /* ---------------- task-11 方案 A：gralloc-free 自描述回退 ---------------- */
++   if (debug_get_bool_option("PANVK_GRALLOC_NO_FALLBACK", false))
++      return result;                    /* 一键回到旧行为，便于 A/B 对照 */
++
++   mesa_logw("u_gralloc cannot describe AHB (%ux%u fmt=0x%x stride=%u "
++             "usage=0x%llx); using self-described LINEAR layout",
++             description.width, description.height, description.format,
++             description.stride, (unsigned long long)description.usage);
++   return vk_android_ahb_layout_from_desc(ahardware_buffer, &description, out,
++                                          out_layouts, max_planes);
+ }
+ 
+ /* From the Android hardware_buffer.h header:

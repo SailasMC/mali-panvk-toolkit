@@ -1,0 +1,106 @@
+--- src/util/u_gralloc/u_gralloc_fallback.c.bak-1791169250	2026-10-05 01:25:07.104414933 +0800
++++ src/util/u_gralloc/u_gralloc_fallback.c	2026-10-05 11:01:11.505219008 +0800
+@@ -15,11 +15,13 @@
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/log.h"
+ #include "util/macros.h"
++#include "util/u_debug.h"
+ #include "util/u_memory.h"
+ 
+ #include <dlfcn.h>
+ #include <errno.h>
+ #include <string.h>
++#include <sys/stat.h>
+ 
+ struct fallback_gralloc {
+    struct u_gralloc base;
+@@ -324,7 +326,13 @@
+       return -EINVAL;
+ 
+    if (!gr_mod || !gr_mod->lock_ycbcr) {
+-      return -EINVAL;
++      /* task-11 (09 §1.1): 这里必须是 -EAGAIN，不是 -EINVAL。
++       * is_hal_format_yuv() 也把 IMPLEMENTATION_DEFINED(0x22) 当 YUV，而它其实
++       * 常常是 RGBX_8888；调用方的 HACK 注释明确要求用 -EAGAIN 表示"不是 YUV，
++       * 请继续走 fourcc 分支"。返回 -EINVAL 会被逐层上抛，直接让
++       * vk_gralloc_to_drm_explicit_layout() 以 VK_ERROR_INVALID_EXTERNAL_HANDLE 失败。
++       * 无 gralloc0 模块（gr_mod == NULL）在语义上等价于"问不到，不是 YUV"。 */
++      return -EAGAIN;
+    }
+ 
+    memset(&ycbcr, 0, sizeof(ycbcr));
+@@ -363,6 +371,62 @@
+    return 0;
+ }
+ 
++/* task-11 ①b（对应 09 §7 方案③b / MR !43659 "infer LINEAR modifier for tightly
++ * packed fallback buffers"）：当厂商 mapper 元数据不可用、只能拿到
++ * modifier = DRM_FORMAT_MOD_INVALID 时，对"紧凑打包的线性"缓冲推断 LINEAR。
++ *
++ * 为什么安全（不是猜）：
++ *  - 能走到这里，说明 fourcc 已由 get_fourcc_from_hal_format(hal_format) 解析成功
++ *    （YUV/未知格式在上面已经返回），行距 strides[0] 已知且 > 0；
++ *  - 若该 dma_buf 的总大小恰为行距的整数倍（st_size % pitch == 0），则其布局
++ *    只可能是逐行紧凑排布（行距已含 gralloc 自己的对齐填充），即 LINEAR；
++ *  - 其余情况（无法 fstat、大小对不齐、多平面、非零 offset、已有真实 modifier）
++ *    一律拒绝并保持原来的失败语义。
++ * panvk 对 DRM_FORMAT_MOD_INVALID 没有 handler（pan_mod_get_handler(INVALID)
++ * == NULL），所以不给 LINEAR 就必然在 pan_image_layout_init 里崩。
++ *
++ * 开关：PANVK_GRALLOC_NO_INFER_LINEAR=1 一键退回旧行为（拒绝并上抛）。
++ */
++static bool
++panvk_infer_linear_modifier(struct u_gralloc_buffer_handle *hnd,
++                            struct u_gralloc_buffer_basic_info *out,
++                            const char *why)
++{
++   if (debug_get_bool_option("PANVK_GRALLOC_NO_INFER_LINEAR", false))
++      return false;
++
++   if (!out || out->modifier != DRM_FORMAT_MOD_INVALID || out->num_planes != 1 ||
++       out->offsets[0] != 0 || out->strides[0] <= 0)
++      return false;
++   if (!hnd || !hnd->handle || hnd->handle->numFds < 1 ||
++       hnd->handle->data[0] < 0)
++      return false;
++
++   struct stat st;
++   if (fstat(hnd->handle->data[0], &st) != 0 || st.st_size <= 0)
++      return false;
++
++   uint64_t size = (uint64_t)st.st_size;
++   if (size % (uint64_t)out->strides[0] != 0)
++      return false;
++
++   uint64_t implied_h = size / (uint64_t)out->strides[0];
++   if (implied_h == 0 || implied_h > 65536)
++      return false;
++
++   out->modifier = DRM_FORMAT_MOD_LINEAR;
++   if (out->alloc_size == 0)
++      out->alloc_size = size;
++   if (out->layer_count == 0)
++      out->layer_count = 1;
++
++   mesa_logi("[PANVK-LINEAR-INFER] %s: fourcc=0x%08x pitch=%d size=%llu "
++             "implied_h=%llu -> DRM_FORMAT_MOD_LINEAR",
++             why, out->drm_fourcc, out->strides[0],
++             (unsigned long long)size, (unsigned long long)implied_h);
++   return true;
++}
++
+ static int
+ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+                                  struct u_gralloc_buffer_handle *hnd,
+@@ -426,6 +490,11 @@
+ 
+    int stable_ret = panvk_v19_query_mapper(hnd->handle, out);
+    if (stable_ret != 0) {
++      /* task-11 ①b：厂商元数据不可用时，退回"紧凑线性"推断（可由环境变量关闭），
++       * 否则保持原有 fail-closed 行为。 */
++      if (panvk_infer_linear_modifier(hnd, out,
++                                      "vendor mapper metadata unavailable"))
++         return 0;
+       mesa_logw("[P0A-V19-FULLPLANE] complete metadata unavailable rc=%d; refusing guessed layout",
+                 stable_ret);
+       return stable_ret;

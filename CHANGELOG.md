@@ -23,7 +23,12 @@
   → 三处分派修正 + 4 处"物理设备当 instance"修正 → vkCreateDevice 成功
   → WSI 关卡 + MESA_VK_WSI_HEADLESS_SWAPCHAIN=1
   → ★★ 判据行达成
-  → VK_ERROR_DEVICE_LOST(-4) 与后续研究
+  → VK_ERROR_DEVICE_LOST(-4) 定位到纹理上传 vkQueueSubmit(v48)
+  → 关掉 dma-heap 反向对照：错误码不变(v49)
+  → 05 方案 A + LINEAR 推断 ⇒ 真 Android 交换链补丁(v50，未上机)
+  → ★★ 独立探针：驱动渲染被证明 · 交换链三路全 VK_SUCCESS · 原假设不能复现
+  → ★★ 掉线真身 = kbase CSF fatal exception 0xc3（发生在执行 draw 时）
+  → 首要目标转向：查 CSF exception 0xc3
 ```
 
 ---
@@ -301,6 +306,11 @@ QCOM 高通专用；CROS 要求 `"CrOS Gralloc"`；
 ⇒ `kbase_kmod.c` 用 `O_RDWR` 打开失败 ⇒ `kbase_kmod_supports_dmabuf()=false`
 ⇒ panvk 落 `sw_device=true`、`supports_modifiers=false` ⇒ DRI3/raw-fd **一行都没走到**。
 
+> ⚠️ **本段已于 M12.4 更正**：上面这句 `O_RDWR` 读的是**旧树** `/root/mesa`（md5 `0f4d40ca…`）；
+> **构建树** `/root/zenithblue/work/mesa`（md5 `e2e92db6…`，出厂件的来源）用的是 **`O_RDONLY`**，
+> 对 0444 节点**能打开成功** ⇒ `supports_dmabuf()` 实为 **true**。
+> 详见 `docs/09 §23.4`。**本段的 `sw_device=true` 结论对出厂件不成立。**
+
 **采用的绕开手段**：`research/07` 的"一行杀招" ——
 
 ```
@@ -371,11 +381,11 @@ MGL 随后在**纹理上传**阶段报 `-4`（`docs/09 §22`）：
 | v49 | `4.9-nodmaheap` | `f1389427` | 10:55:12 | 再加 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`（**针对 M9 的 0444 dmabuf 根因做反向对照**） |
 | v50 | `5.0-wsi-patched` | `677d81eb` | 11:03:30 | **真 Android 交换链版**：载荷换成新的 `libvulkan_panfrost.so`（改名 `libvulkan_freedreno.so`）+ v49 的 `libMobileGL.so`；env 含 `PANVK_GRALLOC_NO_FALLBACK=0`、`PANVK_GRALLOC_NO_INFER_LINEAR=0` |
 
-> ⚠️ **v50 的实机结果不在本仓库的既有记录里**（`docs/09` 最后一节是 §22，对应 v47）。
-> v48/v49/v50 的"用途"来自其**清单原文**（`versionName` + `pojavEnv`），
-> **其运行结论未经验证，本文档不作断言**。
+> ✅ **本注已被 M12 取代**：v48/v49 的**运行结论**与 v50 的**构建/补丁结论**现已记录在
+> **M12**（证据 `docs/09 §23`/`§24`/`§25`、`research/11`、`research/12`）。
+> **唯一仍然"未验证"的是 v50 的实机运行**（该补丁从未在真机上启动过，见 M12.2）。
 
-**后续研究（10 篇专题 + 综述论文）**
+**后续研究（12 篇专题 + 综述论文）**
 
 | 编号 | 主题 | 结论要点 |
 |---|---|---|
@@ -388,12 +398,97 @@ MGL 随后在**纹理上传**阶段报 `-4`（`docs/09 §22`）：
 | 07 | MobileGL 能否绕开交换链 | 不存在"只改配置就出画面"的路；★ `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`（**本仓库 M9→M10 采用的正是它**） |
 | 08 | ZL2 如何交 Surface | 桥的选择**完全由 `POJAV_RENDERER` 字符串决定**；`gallium_*`/`vulkan_zink` ⇒ OSMesa 桥，**一次都不调 `vkCreateSwapchainKHR`**，代价是每帧 CPU 合成 |
 | 09 | 真实世界先例 | `VK_ERROR_INVALID_EXTERNAL_HANDLE` / `u_gralloc` 的公开案例与补丁（⚠️ **尚无中文摘要**） |
-| 10 | 验证方案与独立探针 | 7 模式探针 `probe10/`（`panvk_wsi_probe.c` 1394 行，**已编译、未上机**）；把卡点**精确化**到 `vkCreateSwapchainKHR` 第 4 步 |
-| — | **综述论文** | [`research/paper.md`](research/paper.md)：5 次错误点迁移 + 三路线对比 + 附录（版本与哈希 / 复现 / 参考文献） |
+| 10 | 验证方案与独立探针 | 7 模式探针 `probe10/`（`panvk_wsi_probe.c`）；把卡点**精确化**到 `vkCreateSwapchainKHR` 第 4 步 —— **已上机，结果见 `research/12`** |
+| 11 | WSI 补丁实施（v50） | 3 个文件**严格加性**改动 + 产物哈希 + **构建目录实测判定**（`android-v4` 唯一产物；`strings \| grep -c wsi_x11`=0、`platforms=['android']` ⇒ **闭合 U4**）；附三份 diff 原文 |
+| 12 | 真机探针 8 模式结果 | ★ **驱动渲染被独立证明**；`win`/`headless`/`winimpdef` 三路 `vkCreateSwapchainKHR` 全 `VK_SUCCESS`（**原假设不能复现**）；唯一可复现的 `-1000072003` 只在 AHB `fmt=0x22`；★ **`-4` 真身 = CSF exception `0xc3`（执行 draw 时）** |
+| — | **综述论文** | [`research/paper.md`](research/paper.md)：**6 次**错误点迁移 + 三路线对比 + 附录（版本与哈希 / 复现 / 参考文献） |
 
-**后续工作优先级**（详见 [`research/paper.md` §7.2](research/paper.md)）：
-P0 查 kbase 侧 fault → P1 完成**构建目录核对**（05 与 06 的矛盾，见下）→ P2 走 R4 杠杆（ARM gralloc 的
-`no_afbc_usage` 位，争取 LINEAR）→ P3 落 05 方案 A → P4 走正路接 imapper4/5 → P5 消双栈 → P6 跑 7 模式探针。
+**后续工作优先级**（详见 [`research/paper.md` §7.2](research/paper.md)）：~~P1 构建目录核对~~（**已闭合**，见 M12.2）、
+~~P6 跑 7 模式探针~~（**已上机**，见 M12.3）⇒ 现行优先级：
+**P0 查 CSF exception `0xc3`**（唯一拦路者，`docs/09 §25.7`）→ P1 用设备侧探针判定
+`O_RDONLY` 下 `DMA_HEAP_IOCTL_ALLOC` 与 `supports_dmabuf()`（`docs/09 §23.3/§23.4`）
+→ P2 v50 上机看 WSI 补丁是否生效 → P3 真实 App 端到端复现 → P4 走正路接 imapper4/5 → P5 消双栈。
+
+---
+
+## M12 · ★★ 第六次错误点迁移：从「WSI」转到「绘制执行」（v48/v49/v50 + 真机探针）
+
+**结论（一句话）**：v48/v49 把 `VK_ERROR_DEVICE_LOST (-4)` 钉在**纹理上传的 `vkQueueSubmit`**；
+v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**把原假设**推翻**并给出新病灶 ——
+`-4` 的真身是 **kbase CSF fatal exception `0xc3`**，发生在**真正执行 draw** 时，
+与 WSI / u_gralloc / dma_heap **无直接关系**。⇒ **首要目标改为"查 CSF exception 0xc3"。**
+
+### M12.1 v48 / v49：诊断加深 + dma_heap 反向对照（证据 `docs/09 §23`）
+
+| 版本 | versionName | sha256 前缀 | 与前一版的**唯一自变量差异** | 运行结论 |
+|---|---|---|---|---|
+| v48 | `4.8-diag-deep` | `e511f980` | 追加 `MESA_DEBUG=1`、`PANVK_DEBUG=1`、`LIBGL_DEBUG=1`、`EGL_LOG_LEVEL=debug`、`MOBILEGL_LOG_FILE_PATH=/sdcard/MG/mgl.log` | `-4` 的**首次出现**被钉在 MGL **纹理上传批次**的 `vkQueueSubmit`（`VkTextureManager.cpp`）；错误码/位置与 v47 相同 |
+| v49 | `4.9-nodmaheap` | `f1389427` | 再追加 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`（关掉 dma-heap ⇒ 退回 kbase 原生分配） | **无效**：错误码不变，`-4` 照旧 ⇒ **dma-heap / dma-buf 不是该 `-4` 的成因** |
+
+**同时复核的源码事实**：构建树 `kbase_kmod.c` 用 **`O_RDONLY`** 打开 `/dev/dma_heap/system`（:1285），
+却用该 fd 做 `DMA_HEAP_IOCTL_ALLOC`（:1569）；本机 dma_heap 节点全 **0444**、`/dev/mali0` 为 **0666**。
+"ALLOC 必然失败"目前是**源码推断，未在设备侧取证**（探针日志里没有 ALLOC 的尝试/失败行）⇒ **标为未验证**。
+
+### M12.2 v50：WSI 补丁（证据 `docs/09 §24`、`research/11`）
+
+**三个文件、严格加性**：① `u_gralloc_fallback.c` 的 `-EINVAL → -EAGAIN`（一行修复）；
+①b 新增 `panvk_infer_linear_modifier()`（MR !43659 式 **LINEAR 推断**）；
+② `vk_android.c` 的 **AHB 自描述回退**（约 150 行，仅在既有调用失败后可达）；
+②b `nativewindow_stub.cpp` 补 `AHardwareBuffer_lockPlanes` 桩（链接需要，运行时仍走系统真实库）。
+
+| 产物 | 值 |
+|---|---|
+| 新 `libvulkan_panfrost.so` | size **20,005,320**，md5 **`e08e07645c16d8ebaa11ca70a09884fd`**，sha256 `a0b2451e…53f2d` |
+| 旧件（出厂件，双份 `.bak-1791169250`） | size 20,003,136，md5 `4417b369591fc2b3df27e22019ccf3a2` |
+| `mgl-panvk-v50.apk` | size 10,187,311，sha256 **`677d81eb29c7c57938573dfd9de20d39ff7f0557d466d3ed7ade9510033fc4b9`** |
+
+**与 v49 的唯一自变量差异 = 删掉 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**（`grep -c HEADLESS` 实测 **0**）；
+保留 v49 的 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`、`MESA_DEBUG=1`、`PANVK_DEBUG=1`。
+⇒ 让真机实验**只有一个自变量**（真 Android 交换链 vs headless）。
+
+> ⚠️ **v50 的实机运行结论仍然缺失（未验证）**：该补丁只有**静态/链接层**验证（两次增量编译 `exit=0`、
+> `SONAME`/`NEEDED` 与旧件逐条一致、APK 载荷 sha256 与新 `.so` 逐位相同），**从未在真机启动过**。
+> 且 `-4` **不能声称已消除**：它出现在 headless 配置下、不经过 AHB/u_gralloc/本补丁。
+
+### M12.3 ★★ 真机探针 8 模式：原假设不能复现，掉线真身是 CSF `0xc3`（证据 `docs/09 §25`、`research/12`）
+
+探针：`panvk_wsi_probe`（277,800 B，md5 **`f735e1f4d03c40f248e76e02565f51e6`**），
+加载的是**补丁前**出厂件 `4417b369…` ⇒ **本节结论独立于 v50 补丁**。
+设备：OPPO PHZ110 / MT6989 / Immortalis-G720 MC12 / Android 16 / **无 root**（特权 shell uid 2000）。
+⚠️ `--mode=all` 不可用（`tri` 的 CSF 掉线会污染同进程后续步骤）⇒ **必须一模式一进程**。
+
+| 模式 | 结果 | 关键 VkResult |
+|---|---|---|
+| `render` | ✅ PASS `failures=0` | Submit 0 → Fences 0 → **三点像素 64/128/191/255 精确** |
+| `tri` | ❌ FAIL | Submit 0 → **Fences −4** + CSF group 0/1/2 `fatal error status 0x7dc002c3 (exception 0xc3)` |
+| `ahb`(0x1) | ✅ PASS `failures=0` | `vkGetAHBProps 0`（allocSize=16384）→ AllocateMemory 0 → 三点像素精确 |
+| `ahbimpdef`(0x22) | ❌ FAIL（可复现 ×2） | `vkGetAHBProps −1000072003`；**唯一可复现的 `-1000072003` 只在 0x22 上** |
+| `mapper` | ✅ PASS | `AIMapper_loadIMapper rc=0 version=5`、`importBuffer rc=0`、5 类 metadata 全正值 |
+| `headless` | ✅ PASS `failures=0` | **CreateSwapchainKHR 0** → images 4 → Present 0 |
+| `win`(0x1) | ✅ PASS `failures=0` | **CreateSwapchainKHR 0** → Present 0 → **窗口像素精确（WINDOW PIXEL PASS）** |
+| `winimpdef` | ✅ PASS（swapchain 段） | **CreateSwapchainKHR 0** → Present 0 |
+
+**三条要点**：
+1. **驱动渲染被独立证明**：`render`（无 surface / 无 Activity / 无 root）提交并等到完成，像素**精确**回读。
+2. **原假设不能复现**：`win` / `headless` / `winimpdef` 三路 `vkCreateSwapchainKHR` **全部 `VK_SUCCESS`**
+   ⇒ "交换链创建必然失败"**在合成探针里不成立**；唯一可复现的 `-1000072003` 只在
+   AHB 用 `IMPLEMENTATION_DEFINED(0x22)` 分配时出现（MESA `Failed to get u_gralloc_buffer_basic_info`）。
+3. ★ **真正让 GPU 掉线的是「绘制」**：`tri` 的 `vkQueueSubmit` 返回 0 但 `vkWaitForFences = -4`，
+   kbase 报三个 CSF group fatal（exception `0xc3`）；**不含 draw 的 clear+copy 全正常**
+   ⇒ **命令提交/内存/导入链路通，坏在实际光栅化执行。**
+
+⇒ **目标转向**：从"修 WSI"改为"**查 CSF exception `0xc3`**"。即使交换链建起来（v50 做的正是这件事），
+**只要真的画东西，GPU 就掉**。（探针结论只覆盖合成探针；推广到真实 App 需一次端到端复现，本轮未做。）
+
+### M12.4 一处**更正**：`O_RDWR` 那句话读的是另一棵树（证据 `docs/09 §23.4`）
+
+存在**两份 `kbase_kmod.c`**，此前混引：`/root/mesa` 版（68,849 B，md5 `0f4d40ca…`）用 **`O_RDWR`**（`research/06` 读的就是它）；
+**构建树** `/root/zenithblue/work/mesa` 版（72,941 B，md5 `e2e92db6…`，与 `patches/kbase-common/files/` 副本逐字节相同）
+用 **`O_RDONLY`**，且其 `mtime`（2026-10-04 22:58）**早于**产物 `mtime`（2026-10-05 01:51）
+⇒ **出厂件编自 `O_RDONLY` 那一份**。`O_RDONLY` 对 0444 节点能打开成功 ⇒
+`kbase_kmod_supports_dmabuf()`（函数体 = `return dma_heap_fd >= 0;`）返回 **true**
+⇒ 上面 M9 的"`supports_dmabuf()=false` ⇒ `sw_device=true`"**对出厂件不成立**。
+这也正好解释 M12.1 的 v49"关掉 dma-heap 无效"。
 
 ---
 
@@ -401,13 +496,24 @@ P0 查 kbase 侧 fault → P1 完成**构建目录核对**（05 与 06 的矛盾
 
 | # | 未解项 | 依据 |
 |---|---|---|
-| U1 | `VK_ERROR_DEVICE_LOST (-4)`（M11） | `docs/09 §22` |
+| U1 | **`VK_ERROR_DEVICE_LOST (-4)` 的真身 = kbase CSF fatal exception `0xc3`**：`vkQueueSubmit` 返回成功、`vkWaitForFences` 得 `-4`，三个 CSF group 同时 fatal（`status 0x7dc002c3`），**发生在真正执行 draw 时**；不含 draw 的 clear+copy 全正常。已定位到"绘制执行"，**尚未修** | `docs/09 §25`、`research/12` |
 | U2 | **双栈隐患**：ZL2 自己的 `load_vulkan()` 又 `dlopen("libvulkan.so")`（系统 loader → blob）并把句柄交给 MGL | `docs/09 §17` |
 | U3 | `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1` 让判据行出现，但**本身不是出画面的方案**（headless present 是空操作） | `docs/09 §22`、`research/07` |
-| U4 | **`research/05` 与 `research/06` 对"出厂 `.so` 出自哪个 build 目录/哪套 platforms"结论矛盾** —— 但实机确实成功创建过 swapchain ⇒ 必须用 md5 + `strings \| grep wsi_x11` 逐个 build 目录核对；**未做** | `summaries/06` §四 |
 | U5 | `driverVersion` 两处记录不一致（探针 `26.2.24.3` vs 真机 `26.2.99`） | `docs/09 §8` vs `§11/§17/§22` |
 | U6 | 机型写法不一致（`docs/09 §7` 作 `PHX110`，其余作 `PHZ110`）⇒ 取 `PHZ110` | `research/10` |
 | U7 | `research/09` 无中文摘要 | [`research/README.md`](research/README.md) §3 |
-| U8 | `research/10` 探针未上机；`research/05` 方案 A 未上机（70–80% 是估计） | `research/10`、`research/05` |
 | U9 | `docs/09 §15` 的"被 `patchelf` 改过 `DT_NEEDED` 的 MGL 被提前加载"是**假设**，未被证实 | `docs/09 §15` |
-| U10 | **v48/v49/v50 的运行结果无记录**（`docs/09` 止于 §22/v47）；本文件只记其**清单用途** | 本文件 M11 注 |
+| U11 | **`O_RDONLY` 下 `DMA_HEAP_IOCTL_ALLOC` 是否成功 / `kbase_kmod_supports_dmabuf()` 的实际返回值**：本轮只做了源码推断（"必然失败"），未在设备侧取证；`research/06` 的注释给出的是**相反**推断 | `docs/09 §23.3` |
+| U12 | **v50（真 Android 交换链补丁）从未在真机运行** ⇒ 只有静态/链接层验证，无运行时证据；`-4` 也不能声称已消除 | `docs/09 §24.5`、`research/11` §7 |
+| U13 | **可复现的 `-1000072003` 只在 AHB `IMPLEMENTATION_DEFINED(0x22)` 上出现**（`Failed to get u_gralloc_buffer_basic_info`）；真实 App 的 Surface 用的正是该格式 ⇒ 与 U1 是**两条独立线** | `docs/09 §25.5`、`research/12` §6 |
+
+**✅ 本轮已闭合（从上方未解项中移出）**
+
+| 原 # | 事项 | 闭合依据 |
+|---|---|---|
+| ~~U4~~ | `research/05` 与 `research/06` 对"出厂 `.so` 出自哪个 build 目录/哪套 platforms"的**矛盾** | ✅ **已闭合**：md5 + `strings` 实测判定 —— 4 个 build 目录中**只有 `/root/zenithblue/build/android-v4` 有产物**；`strings <so> \| grep -c wsi_x11` = **0**、`build.ninja` 中 x11 = **0** 次、meson `platforms=['android']` ⇒ **05 号对、06 号的"出厂件含 x11 WSI"不成立**（`android-deps-x11` 只是 include 目录名）。见 `docs/09 §24.4`、`research/11` §1 |
+| ~~U8~~ | `research/10` 探针未上机；`research/05` 方案 A 未上机 | ✅ **探针已上机**（8 模式，见 `docs/09 §25`、`research/12`）；**方案 A 已实施并编入 v50**（见 `docs/09 §24`、`research/11`）——但 v50 本身仍未上机（保留为 **U12**） |
+| ~~U10~~ | v48/v49/v50 的运行结果无记录（`docs/09` 止于 §22/v47） | ✅ **已闭合**：`docs/09` 新增 **§23（v48/v49）**、**§24（v50）**、**§25（探针 8 模式）**，本文件新增 **M12** |
+
+> **未闭合项的口径**：v50 的实机运行（U12）与 dma_heap 的 `O_RDONLY`/ALLOC 判定（U11）
+> 是**本轮唯一新增的两个未知**；其余未解项与上一版一致，未被本轮证据触及。

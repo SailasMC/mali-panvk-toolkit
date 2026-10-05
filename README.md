@@ -8,8 +8,8 @@
 研究论文与结论摘要。所有工具与结论都在
 **OPPO PHZ110 / 天玑 9300（MT6989）/ Immortalis-G720 MC12 / Android 16 (SDK 36) / 无 root** 上实测过。
 
-> **本仓库是这条线的唯一权威记录**：工程实录在 [`docs/09-mobilegl-integration.md`](docs/09-mobilegl-integration.md)（22 节），
-> 专题研究在 [`research/`](research/)（10 篇正文 + 中文摘要 + [`paper.md`](research/paper.md) 综述论文），
+> **本仓库是这条线的唯一权威记录**：工程实录在 [`docs/09-mobilegl-integration.md`](docs/09-mobilegl-integration.md)（25 节），
+> 专题研究在 [`research/`](research/)（12 篇正文 + 中文摘要 + [`paper.md`](research/paper.md) 综述论文），
 > 产物台账在 [`MANIFEST.md`](MANIFEST.md)，里程碑在 [`CHANGELOG.md`](CHANGELOG.md)。
 > 凡"未验证/不一致"的内容，各处均已如实标注。
 
@@ -49,6 +49,9 @@
 | 7 | loader 语义打通：123 项 thunk 表 + 三级分派 | 队列族 `count=1 / flags=0x7 queues=2`、feature `xor` 全 0（[`docs/09` §20.2](docs/09-mobilegl-integration.md)） |
 | 8 | `vkCreateDevice` 成功 | MGL 日志中不再出现 `vkCreateDevice FATAL` |
 | 9 | **判据行达成**（上面那条） | `mgl-panvk-v47`（[`docs/09` §22](docs/09-mobilegl-integration.md)） |
+| 10 | **`VK_ERROR_DEVICE_LOST (-4)` 被钉在「纹理上传的 `vkQueueSubmit`」**（v48 诊断加深；v49 关掉 dma-heap 做反向对照 ⇒ **错误码不变**，排除 dma-heap/dma-buf） | [`docs/09` §23](docs/09-mobilegl-integration.md) |
+| 11 | **v50：真 Android 交换链补丁**（05 方案 A + MR !43659 式 LINEAR 推断，3 文件严格加性；新 `.so` md5 `e08e0764…`）+ **构建目录判定闭合**（只有 `build/android-v4` 有产物、`platforms=['android']`、`wsi_x11` 计数 0） | [`docs/09` §24](docs/09-mobilegl-integration.md)、[`research/11`](research/11-wsi-patch-implementation.md) |
+| 12 | ★★ **独立探针：驱动渲染被证明**（`render` 像素 64/128/191/255 三点精确、`failures=0`；`win` 的 present 真落到窗口 buffer）**且原假设不能复现**（`win`/`headless`/`winimpdef` 三路 `vkCreateSwapchainKHR` 全 `VK_SUCCESS`）；★ **真正掉线的是「绘制」** ⇒ `tri` 的 `vkQueueSubmit` 成功但 `vkWaitForFences = -4`，kbase 报 **CSF fatal exception `0xc3`** | [`docs/09` §25](docs/09-mobilegl-integration.md)、[`research/12`](research/12-probe-run-results.md) |
 
 ### 同样重要的**负面**结论（可复用价值最高）
 
@@ -58,7 +61,7 @@
 | N2 | **在插件 lib 目录顶替 `libvulkan.so.1` 会让 JVM 卡死**在 `[DEBUG] Calling JLI_Launch`，与垫片是否"完整"**无关**（裸 ICD 与 125 入口完整垫片症状相同） | [`docs/09` §9②/§13](docs/09-mobilegl-integration.md) |
 | N3 | **`/storage`（FUSE）是 noexec** —— 驱动 `.so` 放 `/sdcard` 必然 `Permission denied`；可执行路径只有插件自己的 `nativeLibraryDir` | [`docs/09` §8](docs/09-mobilegl-integration.md) |
 | N4 | **插件 lib 目录不在 launcher 命名空间（`clns-9`）搜索路径**（`ld_library_paths=""`）⇒ 裸名 `DT_NEEDED` 永远找不到；正解是 `pojavEnv: DLOPEN=` 预加载 + 垫片**必须带 `DT_SONAME`** | [`docs/09` §15/§17](docs/09-mobilegl-integration.md) |
-| N5 | **`/dev/dma_heap/system` 权限 0444** ⇒ kbase 的 dmabuf 支持关闭 ⇒ panvk 落 `sw_device=true`，DRI3/raw-fd 一行都没走到 | [`research/06`](research/06-panvk-wsi.md) |
+| N5 | **`/dev/dma_heap/system` 权限 0444**。⚠️ **本条的因果链已更正**：0444 读的是**旧树** `/root/mesa`（`O_RDWR`）；**构建树**用的是 **`O_RDONLY`**，对 0444 节点**能打开成功** ⇒ `kbase_kmod_supports_dmabuf()` 实为 **true**（"`sw_device=true`"不成立），失败被推迟到分配时的 `DMA_HEAP_IOCTL_ALLOC`（**该步是否失败尚未在设备侧取证**） | [`research/06`](research/06-panvk-wsi.md)（更正见 [`docs/09` §23.3/§23.4](docs/09-mobilegl-integration.md)） |
 | N6 | **纯 NDK 无法绕开 gralloc**：整个 Android 公开 API 都没有返回 **DRM modifier** 的函数，而 panvk **强制要求** modifier | [`research/03`](research/03-libgralloctypes.md)、[`research/06`](research/06-panvk-wsi.md) |
 | N7 | **本机 5 个既有 `u_gralloc` 后端全部不可用**（imapper4/5 在 `-Dandroid-stub=true` 下**根本没编**）⇒ 必须新增后端或打补丁 | [`research/04`](research/04-mesa-ugralloc.md) |
 
@@ -74,13 +77,15 @@ mali-panvk-toolkit/
 ├── NOTICE.md / LICENSE       ← 第三方来源与许可（MIT）
 │
 ├── docs/                     ← 工程实录与分主题文档
-│   ├── 09-mobilegl-integration.md   ★★ 22 节，主战场实录（原文日志 + 源码行号）
+│   ├── 09-mobilegl-integration.md   ★★ 25 节，主战场实录（原文日志 + 源码行号；§23–§25 = v48/v49/v50 + 真机探针）
 │   ├── 01-why-mali.md … 08-mobilegl-vulkan.md   背景/构建/发现/路线图
 │   └── README.md
 │
 ├── research/                 ← 研究论文与结论摘要
-│   ├── paper.md              ★ 综述论文（摘要/引言/背景/方法/5 次失败点迁移/证据/讨论/附录）
-│   ├── 01-aidl-route.md … 10-verify-probe.md    10 篇专题正文
+│   ├── paper.md              ★ 综述论文（摘要/引言/背景/方法/6 次失败点迁移/证据/讨论/附录）
+│   ├── 01-aidl-route.md … 12-probe-run-results.md   12 篇专题正文
+│   ├── 11-wsi-patch-implementation.md   ★ v50 WSI 补丁实施 + 构建目录实测判定
+│   ├── 12-probe-run-results.md          ★★ 真机探针 8 模式结果（渲染被证明 / CSF 0xc3）
 │   ├── summaries/            中文结论摘要（决策用）
 │   ├── 00-paper-skeleton.md  论文骨架（写作过程记录）
 │   └── README.md             完整索引（正文 + 摘要 + 状态）
@@ -223,21 +228,39 @@ FCL 用 `queryIntentActivities(Intent(ACTION_MAIN))` 扫描插件。APK 里只�
 ### 5.1 已经确定的
 
 `vkCreateInstance` ✓ · `vkCreateDevice` ✓ · 队列族 `flags=0x7 queues=2` ✓ ·
-feature 逐位一致（`xor` 全 0）✓ · surface/交换链参数全部合法 ✓ · **判据行达成** ✓
+feature 逐位一致（`xor` 全 0）✓ · surface/交换链参数全部合法 ✓ · **判据行达成** ✓ ·
+**驱动渲染被独立证明** ✓（探针 `render` / `ahb` / `win` 三模式 `failures=0`，像素精确回读）
 
-### 5.2 未决问题（**未解决**，如实列出）
+### 5.2 当前首要未决问题
+
+> ★ **首要未决问题 = kbase CSF fatal exception `0xc3`**。
+> 真机探针证明：**命令提交 / 内存 / 导入链路是通的，坏在图形管线的实际光栅化执行** ——
+> `tri` 模式 `vkQueueSubmit` 返回成功、`vkWaitForFences` 得 `-4`，kbase 报三个 CSF group
+> `fatal error: status 0x7dc002c3 (exception 0xc3)`；而**不含 draw 的 clear+copy 全部正常**
+> （[`docs/09` §25.6/§25.7](docs/09-mobilegl-integration.md)、[`research/12`](research/12-probe-run-results.md)）。
+> ⇒ **WSI 不是最终瓶颈，CSF 绘制执行才是**；原来的"修 WSI"目标已降级
+> （探针还证明"交换链创建必然失败"这个原假设**不能复现**：`win`/`headless`/`winimpdef` 三路全 `VK_SUCCESS`）。
 
 | # | 问题 | 现状 | 依据 |
 |---|---|---|---|
-| U1 | **`VK_ERROR_DEVICE_LOST (-4)`**：判据行达成后，MGL 在**纹理上传**阶段报 `-4`（`vkQueueSubmit(texture upload batch)` / `vkWaitForFences -4`）⇒ **判据行成立，但这一版还不能稳定游玩** | 待查 kbase 侧 fault（`dmesg`/logcat 的 mali/kbase 记录） | [`docs/09` §22](docs/09-mobilegl-integration.md) |
+| U1 | ★ **CSF exception `0xc3`**（= `VK_ERROR_DEVICE_LOST (-4)` 的真身）：真正执行 draw 时三个 CSF group 同时 fatal | **首要目标**；取证方向见 §25.7（`logcat -b all` / `dmesg` 抓 mali/kbase fault + 最小化 draw 对照） | [`docs/09` §25](docs/09-mobilegl-integration.md)、[`research/12`](research/12-probe-run-results.md) |
 | U2 | **双栈隐患**：MGL 直连符号走我们的 ICD，而 ZL2 自己的 `load_vulkan()` 又 `dlopen("libvulkan.so")`（系统 loader → blob）并把句柄交给 MGL ⇒ "swapchain/surface 由 blob 建、却塞给我们的 ICD" | 需消掉双栈（改 MGL 本体 / 自建 launcher / 写 WSI 判别探针） | [`docs/09` §17](docs/09-mobilegl-integration.md) |
-| U3 | **"出画面"仍依赖 WSI 修复**：我们用的是 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`（headless 交换链，`queue_present` 空操作）——它让判据行出现，但**本身不是出画面的方案** | 三条路线对比见 [`research/paper.md` §6](research/paper.md) | [`research/07`](research/07-mobilegl-wsi.md)、[`research/05`](research/05-bypass-patch.md) |
-| U4 | **构建目录尚未核对**：[`research/05`](research/05-bypass-patch.md) 与 [`research/06`](research/06-panvk-wsi.md) 对"出厂 `.so` 出自哪个 build 目录/哪套 platforms"**结论矛盾**，但实机确实成功创建过 swapchain ⇒ 必须用 md5 + `strings \| grep wsi_x11` 逐个 build 目录核对 | **未做**；不做则路线 A 可能改错源码树 | [`research/summaries/06-结论摘要与决定性事实.md`](research/summaries/06-结论摘要与决定性事实.md) §四 |
+| U3 | **"出画面"仍依赖 WSI 修复**：v47/v50 之前用的是 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`（headless 交换链，`queue_present` 空操作）——它让判据行出现，但**本身不是出画面的方案**；v50 已删掉该开关、改走真交换链，但**未上机** | 三条路线对比见 [`research/paper.md` §6](research/paper.md)；v50 待上机 | [`research/07`](research/07-mobilegl-wsi.md)、[`research/05`](research/05-bypass-patch.md)、[`docs/09` §24](docs/09-mobilegl-integration.md) |
 | U5 | **`driverVersion` 两处记录不一致**：探针报 `26.2.24.3`，真机日志报 `26.2.99` | 未核对是否同一份 `.so` | [`docs/09` §8 vs §11/§17/§22](docs/09-mobilegl-integration.md) |
 | U6 | **机型写法不一致**：`docs/09` §7 写 `OPPO PHX110`，§8 与实测写 `PHZ110` | 取 **PHZ110**，PHX110 视为笔误 | [`research/10`](research/10-verify-probe.md) |
 | U7 | **`research/09`（真实世界先例）没有中文摘要** | 缺口 | [`research/README.md`](research/README.md) §3 |
-| U8 | **`research/10` 的 7 模式探针未在真机运行**；[`research/05`](research/05-bypass-patch.md) 的方案 A（约 90–105 行补丁）**未上机**，其"成功率 70–80%"是**估计**而非实测 | 缺上机 | [`research/10`](research/10-verify-probe.md)、[`research/05`](research/05-bypass-patch.md) |
 | U9 | [`docs/09` §15](docs/09-mobilegl-integration.md) 关于"被 `patchelf` 改过 `DT_NEEDED` 的 MGL 被提前加载"是**假设**，当轮**未被证实** | 需按原文给的验证方法做 A/B | [`docs/09` §15](docs/09-mobilegl-integration.md) |
+| U10 | **v50（真 Android 交换链补丁）从未在真机运行** ⇒ 只有静态/链接层验证，没有运行时证据；`-4` 也不能声称已被它消除（该链不经过本补丁） | 待上机（覆盖安装即可，同包名同签名） | [`docs/09` §24.5](docs/09-mobilegl-integration.md)、[`research/11`](research/11-wsi-patch-implementation.md) §7 |
+| U11 | **唯一可复现的 `VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)` 只在 AHB 用 `IMPLEMENTATION_DEFINED(0x22)` 分配时出现**（MESA `Failed to get u_gralloc_buffer_basic_info`），而真实 App 的 Surface 用的正是该格式 | 与 U1 是**两条独立线**，不要合并看 | [`docs/09` §25.5](docs/09-mobilegl-integration.md)、[`research/12`](research/12-probe-run-results.md) §6 |
+| U12 | **`O_RDONLY` 打开的 dma-heap fd 下 `DMA_HEAP_IOCTL_ALLOC` 是否成功 / `kbase_kmod_supports_dmabuf()` 的实际返回值** | 仅**源码推断**（"必然失败"），未在设备侧取证；`research/06` 的注释给出**相反**推断 | [`docs/09` §23.3/§23.4](docs/09-mobilegl-integration.md) |
+
+**✅ 本轮已闭合（从"未决"移出）**
+
+| 原 # | 事项 | 闭合依据 |
+|---|---|---|
+| ~~U4~~ | **构建目录矛盾**（[`research/05`](research/05-bypass-patch.md) vs [`research/06`](research/06-panvk-wsi.md)） | ✅ **已闭合**：4 个 build 目录中**只有 `/root/zenithblue/build/android-v4` 有产物**；`strings \| grep -c wsi_x11` = **0**、`build.ninja` 中 x11 = **0** 次、meson `platforms=['android']` ⇒ **05 号对、06 号的"出厂件含 x11 WSI"不成立**（`android-deps-x11` 只是 include 目录名）。见 [`docs/09` §24.4](docs/09-mobilegl-integration.md)、[`research/11`](research/11-wsi-patch-implementation.md) §1 |
+| ~~U8~~ | 探针未上机；方案 A 未上机 | ✅ **探针已上机**（8 模式，[`docs/09` §25](docs/09-mobilegl-integration.md)）；**方案 A 已实施并编入 v50**（[`docs/09` §24](docs/09-mobilegl-integration.md)）。⚠️ 但 v50 本身仍未上机（保留为 **U10**） |
+| ~~U10(旧)~~ | v48/v49/v50 的运行结果无记录 | ✅ **已闭合**：[`docs/09`](docs/09-mobilegl-integration.md) 新增 **§23（v48/v49）/§24（v50）/§25（探针）**，[`CHANGELOG.md`](CHANGELOG.md) 新增 **M12** |
 
 > ⚠️ 另有一条**硬约束**贯穿始终：**驱动二进制不进本仓库**（体积 + 许可）。
 > 本仓库只收**知识 / 源码 / 清单**；APK/`.so` 只以**文件名 + 大小 + sha256 前缀 + 一句话用途**的形式

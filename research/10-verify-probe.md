@@ -1,5 +1,11 @@
 # 任务 10：验证方案与独立探针设计（panvk WSI / u_gralloc）
 
+> ✅ **仓库注（2026-10-05 补）**：本报告是**探针设计阶段**的快照，文中"未在真机运行"的表述
+> 已由后续实测取代 —— 探针**已上机**，8 模式结果见
+> [`12-probe-run-results.md`](12-probe-run-results.md) 与 [`../docs/09` §25](../docs/09-mobilegl-integration.md)。
+> 另：探针自身有三个"一跑就退"的 bug（A/B/C），已修并重编（`12-probe-run-results.md` §1）。
+> **本文件正文保持原样（原样收录），以此注为准。**
+
 **目标设备**：OPPO PHZ110（MT6989 / Immortalis-G720 / Android 16 / 无 root）
 **被测产物**：`/root/zenithblue/build/android-v4/src/panfrost/vulkan/libvulkan_panfrost.so`
 （md5 `4417b369591fc2b3df27e22019ccf3a2`，与 `/root/zenithblue/dist/android-g720-v12-csf/libvulkan_panfrost.so` 逐字节相同，本次实测）

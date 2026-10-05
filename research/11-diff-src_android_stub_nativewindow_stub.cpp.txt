@@ -1,0 +1,18 @@
+--- src/android_stub/nativewindow_stub.cpp.bak-1791169250	2026-10-05 01:25:07.184416581 +0800
++++ src/android_stub/nativewindow_stub.cpp	2026-10-05 11:02:51.966979035 +0800
+@@ -116,4 +116,15 @@
+ int32_t ANativeWindow_unlockAndPost(ANativeWindow *window) { return 0; }
+ int32_t AHardwareBuffer_lock(AHardwareBuffer *buffer, uint64_t usage, int32_t fence, const ARect *rect, void **outVirtualAddress) { return 0; }
+ int32_t AHardwareBuffer_unlock(AHardwareBuffer *buffer, int32_t *fence) { return 0; }
++
++/* task-11：vk_android.c 的 AHB 自描述回退在 desc.stride==0 时会调它实测行距。
++ * 离线/宿主桩故意返回失败，让调用方 fail-closed；设备上解析到的是系统真实
++ * libnativewindow.so，它会给出真实 rowStride。 */
++int32_t AHardwareBuffer_lockPlanes(AHardwareBuffer *buffer, uint64_t usage,
++                                   int32_t fence, const ARect *rect,
++                                   AHardwareBuffer_Planes *outPlanes)
++{
++   (void)buffer; (void)usage; (void)fence; (void)rect; (void)outPlanes;
++   return -EINVAL;
++}
+ }

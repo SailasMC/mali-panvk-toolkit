@@ -53,8 +53,8 @@
 | v45 | `4.5-pd-fixed` | 10,183,215 | `01313450de7bae85` | 10:13 | **4 处"把物理设备当 instance"修正落地**。**用于验证**修正后队列族 `count=1 / flags=0x7 queues=2`、feature `xor` 全 0、`vkCreateDevice` 成功 |
 | v46 | `4.6-wsi-diag` | 10,183,215 | `81083a6e7e9ac8b6` | 10:24 | 增加 `SurfaceCaps:` 与 `CreateSwapchain: surf/usage/fmt/pm/alpha/layers/old` 落盘。**用于验证**交换链入参是否合法 ⇒ 参数全合法但仍 `VK_ERROR_INVALID_EXTERNAL_HANDLE`，把卡点精确到 Mesa `u_gralloc` |
 | v47 | `4.7-headless-wsi` | 10,183,215 | `bb6898389f9e791d` | **10:43** | ★★ **判据行达成版本**。载荷 = v46 + `pojavEnv` 增加 **`MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**。**用于验证**"坏的只有 WSI"：Mesa 把任意 surface 换成 headless 交换链、`queue_present` 空操作返回 `VK_SUCCESS` ⇒ 游戏日志出现 `OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)`（实测时间 10:46:13）。**※ `docs/09` §22 原文给出的前缀 `bb689838` 与本行实测一致 ✓** |
-| v48 | `4.8-diag-deep` | 10,183,215 | `e511f980b8a63d53` | 10:50 | 在 v47 基础上**加深诊断**：追加 `MESA_DEBUG=1`、`PANVK_DEBUG=1`、`MOBILEGL_LOG_FILE_PATH=/sdcard/MG/mgl.log`、`LIBGL_DEBUG=1`、`EGL_LOG_LEVEL=debug`。**用于**给 `VK_ERROR_DEVICE_LOST (-4)` 取证（⚠️ **运行结论无记录**） |
-| v49 | `4.9-nodmaheap` | 10,183,215 | `f1389427f687a0cd` | 10:55 | 在 v48 基础上追加 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`。**用于**针对 `/dev/dma_heap/system` **0444** 这条根因做**反向对照**（⚠️ **运行结论无记录**） |
+| v48 | `4.8-diag-deep` | 10,183,215 | `e511f980b8a63d53` | 10:50 | 在 v47 基础上**加深诊断**：追加 `MESA_DEBUG=1`、`PANVK_DEBUG=1`、`MOBILEGL_LOG_FILE_PATH=/sdcard/MG/mgl.log`、`LIBGL_DEBUG=1`、`EGL_LOG_LEVEL=debug`。**用于**给 `VK_ERROR_DEVICE_LOST (-4)` 取证。**运行结论**（[`docs/09 §23.1`](docs/09-mobilegl-integration.md)）：`-4` 的**首次出现**被钉在 MGL **纹理上传批次**的 `vkQueueSubmit`（`VkTextureManager.cpp`），错误码/位置与 v47 相同；该链**不创建 AHB、不经过 `u_gralloc`、也不经过任何 WSI 代码** |
+| v49 | `4.9-nodmaheap` | 10,183,215 | `f1389427f687a0cd` | 10:55 | 在 v48 基础上追加 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`。**用于**针对 `/dev/dma_heap/system` **0444** 这条根因做**反向对照**（关掉 dma-heap ⇒ 退回 kbase 原生分配）。**运行结论**（[`docs/09 §23.2`](docs/09-mobilegl-integration.md)）：**无效** —— 错误码不变、`-4` 照旧 ⇒ **dma-heap / dma-buf 不是该 `-4` 的成因** |
 
 **注 1**：`v17` 的完整 sha256 见 §B 的原始输出（本表只列前 16 位）。
 **注 2**：v16–v49 中「**恢复包**」（`*-restore-good`）的作用是把设备恢复到**已知可跑**的配置，
@@ -77,7 +77,7 @@
 | v13 | — | 10,379,823 | `61b45ee2c38396bd` | v12 之后的迭代（**用途无记录**） |
 | v14 | `1.4-panvk` | 14,688,889 | `c7cde6b8581b0cd0` | 把**裸 ICD** 放进插件 lib 目录 ⇒ **JVM 卡死在 `JLI_Launch`**（`docs/09` §9②、§13 的原始事故） |
 | v15 | `1.5-panvk-rollback` | 10,379,823 | `f7fb5ecd9d640fdd` | 上述事故的**回滚版**（注意：回滚也必须**递增 `versionCode`**，降级安装会被 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒绝，`docs/09` §9） |
-| v50 | `5.0-wsi-patched` | 10,187,311 | `677d81eb29c7c579` | **判据行之后的"真 Android 交换链版"**：载荷换成**新的 `libvulkan_panfrost.so`**（改名 `libvulkan_freedreno.so`）+ v49 的 `libMobileGL.so` + `classes.dex`；`pojavEnv` 含 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`、`MESA_DEBUG=1`、`PANVK_DEBUG=1`、`PANVK_GRALLOC_NO_FALLBACK=0`、`PANVK_GRALLOC_NO_INFER_LINEAR=0`。打包脚本见 [`source/pack/pack_v50.sh`](source/pack/pack_v50.sh)（⚠️ **运行结论无记录**；`docs/09` 止于 §22 / v47） |
+| v50 | `5.0-wsi-patched` | 10,187,311 | `677d81eb29c7c579` | **判据行之后的"真 Android 交换链版"**：载荷换成**新的 `libvulkan_panfrost.so`**（改名 `libvulkan_freedreno.so`，size 20,005,320 / md5 `e08e0764…` / sha256 `a0b2451e…`）+ v49 的 `libMobileGL.so` + `classes.dex`；`pojavEnv` 含 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`、`MESA_DEBUG=1`、`PANVK_DEBUG=1`、`PANVK_GRALLOC_NO_FALLBACK=0`、`PANVK_GRALLOC_NO_INFER_LINEAR=0`，**且已删掉 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**（与 v49 的**唯一自变量差异**）。打包脚本见 [`source/pack/pack_v50.sh`](source/pack/pack_v50.sh)。**运行结论**：[`docs/09 §24`](docs/09-mobilegl-integration.md)（补丁范围 / 产物哈希 / **构建目录实测判定**，`research/11`）+ [`docs/09 §25`](docs/09-mobilegl-integration.md)（探针 8 模式，`research/12`）——**唯一致命注意**：**本 APK 从未在真机运行过**，补丁只有静态/链接层验证；而探针已独立证明"原假设（交换链建不起来）不能复现"，真正让 GPU 掉线的是**执行 draw 时的 CSF exception `0xc3`** |
 
 ---
 
@@ -115,6 +115,9 @@
 | [`source/pack/pack_v50.sh`](source/pack/pack_v50.sh) | 3,003 | `b66d33b6fb58dfd7` | `/root/pack_v50.sh` —— **v50**（真 Android 交换链版）的打包脚本，含完整清单模板 |
 | [`source/pack/verify_mgl.sh`](source/pack/verify_mgl.sh) | 604 | `cff66dd940a44997` | `/root/verify_mgl.sh` —— 装机后的验证脚本 |
 | [`source/pack/AndroidManifest.v46.xml`](source/pack/AndroidManifest.v46.xml) | 1,439 | `22310107ed2eb6cd` | `/root/v46/AndroidManifest.xml` —— **插件清单模板**（`fclPlugin` / `renderer` / `pojavEnv` / `des` / `minMCVer`） |
+| [`research/11-wsi-patch-implementation.md`](research/11-wsi-patch-implementation.md) | 22,910 | `ea1444069d6c534a` | `/root/research/11-wsi-patch-implementation.md` —— **v50 WSI 补丁实施报告**（3 文件 diff 摘要 + 产物哈希 + ★ 构建目录实测判定，闭合 U4）。另逐字收录三份 diff 原文：[`11-diff-src_util_u_gralloc_u_gralloc_fallback.c.txt`](research/11-diff-src_util_u_gralloc_u_gralloc_fallback.c.txt)（4,453 B）/ [`11-diff-src_vulkan_runtime_vk_android.c.txt`](research/11-diff-src_vulkan_runtime_vk_android.c.txt)（8,272 B）/ [`11-diff-src_android_stub_nativewindow_stub.cpp.txt`](research/11-diff-src_android_stub_nativewindow_stub.cpp.txt)（1,084 B） |
+| [`research/12-probe-run-results.md`](research/12-probe-run-results.md) | 19,911 | `794b1236fbbce55c` | `/root/research/12-probe-run-results.md` —— ★★ **真机探针 8 模式结果**（渲染被独立证明 / 原假设不能复现 / `-4` = CSF `0xc3`） |
+| [`research/summaries/09-结论摘要.md`](research/summaries/09-结论摘要.md) | 7,836 | `df011e384b7ef182` | 09 号（真实世界先例）的**中文结论摘要** —— 补齐 `research/README.md` §3 记录的缺口 |
 
 > 签名用 keystore（`/root/dsh-driver.keystore`，别名 `dshdriver`，口令为脚本内明文 `android`）
 > **不纳入本仓库**。打包脚本按原样收录以便复现流程，使用者需自备 key。
