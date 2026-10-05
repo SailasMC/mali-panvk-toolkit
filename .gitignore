@@ -72,6 +72,9 @@ latest.log
 latest_game.log
 logcat*.txt
 dmesg*.txt
+# 例外：research/attachments/ 下的原始证据文件（构建日志 / diff / 校验程序）随报告进仓库
+# （如 research/attachments/16/16-p1-build.log 是 **报告引用的原文**，不是运行期垃圾日志）
+!research/attachments/**
 
 # --- 5. 本地/环境相关（不放路径、设备序列号、凭据）--------------------------
 .credentials

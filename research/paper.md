@@ -584,6 +584,11 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 | v50 与 v49 的**唯一自变量差异** = 删掉 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1` | §24.3 |
 | ★ **构建目录实测判定（闭合 U4）**：4 个 build 目录只有 `android-v4` 有产物；`wsi_x11` 计数 0、`platforms=['android']` ⇒ 06 号的"含 x11 WSI"不成立 | §24.4 |
 | ★★ **真机探针 8 模式**：驱动渲染被独立证明；三路 `vkCreateSwapchainKHR` 全 `VK_SUCCESS`（原假设不能复现）；`-4` = CSF exception `0xc3` | §25 |
+| ★ **v50 上机：首次真交换链 + 真画面**（`Swapchain created, extent = 2376x1080, swapchain imageCount = 3`；主界面含 3D 全景干净渲染约 10 秒，之后黑屏崩溃 `present`/`acquire` → `-4`） | §28.4 |
+| v51 空载荷 APK（`unzip` 匹配失败）⇒ **废弃**；教训：打包后必须数载荷条目 + `unzip -p … \| sha256sum` 比对 | §26.1 |
+| v52 = v50 载荷 + 全套调试 env；**logcat 环形缓冲会冲掉证据** ⇒ 必须后台落盘 `logcat -b all -v time > /tmp/cap.txt`；`pkill -f` 会自杀 ⇒ 用 `pkill -x logcat` | §26.2–§26.4 |
+| ★ **v52 抓到决定性一行** `E/MESA: kbase: CSF group 0 tiler heap OOM notification`（判据行 → +5~10 s 该行 → +9 s `-4`） | §28.5 |
+| ★ **v53（P1）补 uAPI 1.18 档 + `csi_handlers` ⇒ 真机无效 ✗**（仍 OOM、无 `TILER_OOM CSI handler (1.18 layout, ioctl 58)`）⇒ 推断版本门挡住 1.18 分支；**下一步 P2** | §27.3、§28.6 |
 | **6 次**错误点迁移总表 | §20.5（§18.2 为前四步早期形态）、§23–§25（第 ⑥ 次） |
 | 队列族 `flags=0x7` / feature `xor=0` / `vkCreateDevice` 成功 | §20.2 |
 | `-3` 的 Mesa 源码根因（`panvk_vX_device.c:376`） | §19 |
@@ -613,7 +618,7 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 | 驱动 WSI 段错（`wsi_GetSwapchainImagesKHR+0x20`） | §16 |
 | 探针实测：从插件 lib 目录 dlopen 成功、`Mali-G720 MC12`、API 1.4.363、扩展 181 | §8 |
 
-### 5.2 来自 `research/01–12`
+### 5.2 来自 `research/01–16`
 
 | 编号 | 本文引用的结论 |
 |---|---|
@@ -629,6 +634,10 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 | `research/10` | 7 模式探针 `probe10/`（`panvk_wsi_probe.c`；**已上机，8 模式结果见 `research/12`**）；卡点**精确化**为 `vkCreateSwapchainKHR` 第 4 步 `vkCreateSwapchainKHR → panvk_android.c:405/293/226 → vk_android_get_ahb_layout() → vk_gralloc_to_drm_explicit_layout() → u_gralloc_get_buffer_basic_info()`；`R8G8B8A8` 的 `GetAndroidHardwareBufferPropertiesANDROID` **不碰** u_gralloc；判据 logcat tag = `MESA` |
 | `research/11` | **v50 WSI 补丁实施**：3 个文件（`u_gralloc_fallback.c` 的 `-EINVAL→-EAGAIN` + `panvk_infer_linear_modifier()`；`vk_android.c` 的 AHB 自描述回退约 150 行；`nativewindow_stub.cpp` 的 `lockPlanes` 桩）**严格加性**；①a 对 WSI 自身 AHB **不生效**（`format=1` 不是 YUV）⇒ 真正放行交换链的是 ①b；新 `.so` md5 `e08e07645c16d8ebaa11ca70a09884fd`/20,005,320 B/sha256 `a0b2451e…`；★ **构建目录判定**：只有 `build/android-v4` 有产物、`wsi_x11` 计数 0、`platforms=['android']` ⇒ **05 对、06 的"含 x11 WSI"不成立**；⚠️ 补丁**从未在真机运行**、`-4` **不能声称已消除** |
 | `research/12` | ★★ **真机探针 8 模式结果**（探针 md5 `f735e1f4…`，加载补丁前出厂件 `4417b369…`）：① `render` 无 surface/无 root，`failures=0`、像素 `64/128/191/255` **三点精确** ⇒ **驱动渲染被独立证明**；② `ahb(0x1)` 全绿（MESA `init how=SPHAL rc=0 version=5`、metadata `*_rc=0 fourcc=0x34324241 alloc=16384 layers=1`）；③ `win(0x1)` 真交换链 + present + **`WINDOW PIXEL PASS`**；④ **原假设不能复现**：`win`/`headless`/`winimpdef` 三路 `vkCreateSwapchainKHR` 全 `VK_SUCCESS`，唯一可复现的 `-1000072003` 只在 AHB `IMPLEMENTATION_DEFINED(0x22)`；⑤ ★ **真正掉线的是绘制**：`tri` 的 `vkQueueSubmit→0` 但 `vkWaitForFences=-4`，kbase 报 **CSF group 0/1/2 fatal `0x7dc002c3` (exception `0xc3`)**；不含 draw 的 clear+copy 全正常 ⇒ 首要目标转为**查 CSF `0xc3`**；⚠️ `--mode=all` 不可用（`tri` 污染同进程） |
+| `research/13` | ★ **CSF `0x7dc002c3`/`0xc3` 定位**：`0x7dc002c3` 是 GPU MMU 的 `AS_FAULTSTATUS` 原值 —— `EXCEPTION_TYPE=0xC3`（**TRANSLATION_FAULT_3**）、`ACCESS_TYPE=READ`、`SOURCE_ID=0x7DC0` = **CSF 固件自己的 LSU**；`sideband 0x0000005fffe1e000` 就是故障 GPU VA；「三 group 同时 fatal」是同一份 payload 被复制给该 kctx 所有在位 CSG（**只有一次**错误访问）；触发面 = 只有真 `vkCmdDraw` 才碰 **tiler heap**（clear/copy 走 `vk_meta` 全屏 fragment，不消费 chunk）；给出 S1/S2/S3 三步最小验证（⚠️ 全部只读，未改只读树） |
+| `research/14` | ★ **tiler heap OOM 定案**：OOM 通知是「验尸报告」（kbase 送通知**之前**已 `term_queue_group()`）；★ 真相 = **堆被顶到天花板且无人重置** —— `initial_chunks=10`/`max_chunks=400`/`chunk_size=1 MiB`，而 Mesa 唯一重置手段 `kbase_renew_tiler_heap()` **是死代码**（`submit->tiler_work_estimate` **全树无写入点**）⇒ 堆单调涨 → `-ENOMEM` → 杀组；★ **10 秒黑洞对上了**：OOM `11:25:37.423` → DEVICE_LOST `11:25:47.413` = **9.99 s** = `KBASE_WAIT_TIMEOUT_NS`；dma_heap 的 `O_RDONLY` **不是**本案凶手；两处最小修法 **(A)** 1.18 布局 + `csi_handlers`、**(B)** 接上 renew（最小 2 行） |
+| `research/15` | **与已跑通先例的彻底 diff**：`/root/panvk-mtk` 只是**补丁仓库**（单 commit，`patches/panvk_mtk.patch` + 构建脚本），源码真身 = `/root/mesa`（`funnymdzz/mesa@6598829`，未打补丁原始态）；两树**同源同作者血脉**（注释逐字相同）⇒ **先例的成功不能归因于任何一处 tiler 参数/workaround**；**6 条**可移植差异，**H1（`csi_handlers` 从未送达内核）最高**、**H2（`tiler_work_estimate` 生产者被整段删掉 ⇒ renew 永不执行）已定论** |
+| `research/16` | ★ **P1 落地（v53）**：版本阶梯 `1.25/1.6` → **`1.25/1.18/1.6`**（新增 1.18：ioctl **`0xc028803a`**、40 B、`csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG`；uAPI 判断保留、`<1.18` 不变）；新 `.so` size **20,005,600** / md5 **`7f3a0e8f…b404`** / sha256 **`58ef996f…bec4`**；**反汇编确认新分支进二进制**；v53.apk sha256 **`9c99af82…d48e`**；★ **真机无效 ✗**（仍 OOM、无 `TILER_OOM CSI handler (1.18 layout, ioctl 58)`）；P2 未实施（v52 就是现成对照） |
 
 ### 5.3 来自中文结论摘要
 
@@ -659,7 +668,7 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 
 **仍然未解/未验证（如实记录）**：
 
-3. **v50 从未在真机运行**（`docs/09` §24.5、`research/11` §7）：补丁只有静态/链接层验证
+3. ~~**v50 从未在真机运行**~~ ⇒ ✅ **已上机**（`docs/09` §28.4）：真交换链建成、主界面干净渲染约 10 秒；⚠️ `-4` 仍在。补丁本身仍只有静态/链接层验证
    （两次增量编译 `exit=0`、`SONAME`/`NEEDED` 与旧件逐条一致、APK 载荷 sha256 逐位相同），
    **没有运行时证据**；且 `-4` **不能声称已被它消除**（该链不经过本补丁）。
 4. **`O_RDONLY` 下 `DMA_HEAP_IOCTL_ALLOC` 是否成功 / `kbase_kmod_supports_dmabuf()` 的实际返回值**
@@ -672,6 +681,11 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 8. **机型写作不一致**（PHX110 / PHZ110，见 2.1 注）。
 9. **`research/09` 没有中文摘要**（见 `research/README.md` §3）。
 10. **`docs/09` §15 的"被 patch 的 MGL 被提前加载"是假设**，当轮**未被证实**。
+
+11. ★ **实验 P1（v53）已上机验证无效 ✗**（`docs/09` §27.3/§28.6、`research/16`）：
+    补了 uAPI 1.18 档并置 `csi_handlers` 后，**仍**出现 `kbase: CSF group 0 tiler heap OOM notification`，
+    且**没有**出现期望的 `TILER_OOM CSI handler (1.18 layout, ioctl 58)` ⇒ 推断 **1.18 分支被版本门挡住**。
+    按 `research/14` 的定案，OOM 的直接成因是 **「堆只涨不落」** ⇒ **下一步 = P2**（§7.2 的 P7）。
 
 > ⚠️ **一处必须同时读的更正**（`docs/09` §23.4、`CHANGELOG.md` M12.4）：本文 2.3 节/§6 沿用的
 > "`/dev/dma_heap/system` 0444 ⇒ `O_RDWR` 打开失败 ⇒ `supports_dmabuf()=false` ⇒ `sw_device=true`"
@@ -765,6 +779,20 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 真正把瓶颈暴露出来的是**独立探针**：它把 pipeline **一环一环单独执行**，
 于是"**提交成功但等不到完成**"这条**只有 draw 才会触发**的分界线才显示出来（§4.7）。
 
+### 6.7 ★ P1（v53）实验之后：`-4` 这条线仍未修，且下一步已明确
+
+§6.6 的判断（「WSI 不是最终瓶颈，CSF 绘制执行才是」）在真机侧**进一步收窄**：
+真实 App 现场抓到的是 **tiler heap OOM** 这条线（`docs/09` §28.5）——
+`E/MESA: kbase: CSF group 0 tiler heap OOM notification`，判据行 → **+5~10 s** 该行 → **+9 s** `-4`。
+针对它的 **P1（v53：CSF group create 走 uAPI 1.18 布局并置 `csi_handlers`）已上机验证无效 ✗**
+（`docs/09` §27.3/§28.6、[`16-p1-p2-implementation.md`](16-p1-p2-implementation.md)）；
+按 [`14-tiler-heap-oom.md`](14-tiler-heap-oom.md) 的定案，OOM 的直接成因是 **「tiler heap 只涨不落」**
+（`kbase_renew_tiler_heap()` 因 `submit->tiler_work_estimate` 全树无生产者而**从未执行**），
+⇒ **下一步明确为 P2**（去掉该前置条件的最小 2 行补丁，见 §7.2 的 **P7**）。
+
+> 口径提醒：`research/13` 的 **CSF exception `0xc3`**（探针 `tri`，绘制路径的 MMU TRANSLATION_FAULT_3）
+> 与本文这条 **tiler heap OOM** 是**两条独立病灶**，**不要合并看**。
+
 ---
 
 ## 7 结论与后续工作
@@ -811,10 +839,13 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 | P4 | **真实 App（ZL2 + MobileGL）端到端复现**，确认探针结论可推广到商业游戏进程 | `docs/09` §25.8 | 中（需允许真实屏 UI 操作的会话） |
 | P5 | 走**正路**：把 `u_gralloc_imapper4`（`research/02`，最便宜）或 `imapper5`（`research/01`，已编出）接进构建 | `research/01/02/04` | 中；imapper5 已解决最难的编译/链接 |
 | P6 | 消掉 §4.8 提到的**双栈**（ZL2 的 `load_vulkan()` 也走我们的 ICD），彻底消除"外来句柄"隐患 | `docs/09` §17 | 中高（需重签/自建 launcher，或改 MGL 本体） |
+| **P7** | ★ **P2 实验：接上 tiler heap renew**（去掉 `submit->tiler_work_estimate` 前置条件，最小 2 行）—— 治「只涨不落」这个 OOM 的直接成因；对照组 = v52（无 flag）/ v53 | [`research/14`](14-tiler-heap-oom.md) Fix B1、[`research/16`](16-p1-p2-implementation.md) §6 | 低（2 行 + 增量重编）；**P1 失效后的当前最高优先级** |
 
 > ✅ **本轮已完成的旧优先级**：旧 **P1**（05/06 构建目录核对）已闭合（§5.4 第 1 条、`docs/09` §24.4）；
 > 旧 **P6**（跑 7 模式探针）已完成并扩到 **8 模式**（`docs/09` §25）；
-> 旧 **P3**（落 05 方案 A）已实施并编入 v50，但**未上机**（新 **P2**）。
+> 旧 **P3**（落 05 方案 A）已实施并编入 v50，**且 v50 已上机**（`docs/09` §28.4：真交换链 + 真画面约 10 秒）；
+> ★ **本轮新增的实验 P1（v53）已上机验证无效 ✗**（`docs/09` §27.3）⇒
+> 落点转到新 **P7（= P2：接上 tiler heap renew，治「只涨不落」）**。
 > 旧 P2（R4 杠杆 `no_afbc_usage`）**未做**，且因 §6.6 的再判断而**降级**。
 
 ---
@@ -852,6 +883,9 @@ LWJGL 出现 `liblwjgl.so: unknown type` 崩溃，一度怀疑是 `DLOPEN` 造�
 | v48 | `4.8-diag-deep` | `e511f980` | 诊断加深；`-4` 的**首次出现**钉在纹理上传的 `vkQueueSubmit` | `docs/09` §23.1、[`../MANIFEST.md`](../MANIFEST.md) |
 | v49 | `4.9-nodmaheap` | `f1389427` | 关掉 dma-heap（`PANVK_KBASE_DMA_HEAP`）做反向对照 ⇒ **错误码不变** | `docs/09` §23.2、[`../MANIFEST.md`](../MANIFEST.md) |
 | v50 | `5.0-wsi-patched` | `677d81eb` | ★ **真 Android 交换链补丁**（新 `.so` md5 `e08e07645c16d8ebaa11ca70a09884fd` / 20,005,320 B）；**从未上机** | `docs/09` §24、[`11-wsi-patch-implementation.md`](11-wsi-patch-implementation.md) |
+| v51 | `5.1-wsi-patched-debug` | `6e9ce7d2` | **空载荷 APK**（`unzip` 匹配失败）⇒ **废弃，勿用**（size 8,595 B） | `docs/09` §26.1、[`../MANIFEST.md`](../MANIFEST.md) §B |
+| v52 | `5.2-wsi-patched-debug` | `0bbef030` | v50 载荷 + 全套调试 env；**落盘 logcat 抓到 `kbase: CSF group 0 tiler heap OOM notification`**（判据行 → +5~10 s → +9 s `-4`） | `docs/09` §26.2/§28.5、[`../MANIFEST.md`](../MANIFEST.md) §B |
+| v53 | `5.3-p1-tiler-oom-csi` | `9c99af82` | ★ **P1**：1.18 档 + `csi_handlers`（新 `.so` md5 `7f3a0e8f…` / 20,005,600 B）⇒ ★ **真机无效 ✗** | `docs/09` §27、[`16-p1-p2-implementation.md`](16-p1-p2-implementation.md) |
 
 > 说明：`docs/09` 只在 §18.3 / §19 / §22 三处**直接给出过 sha256 前缀**（v39 / v41 / v47），
 > 三者与本仓库在服务器 `/root/final/` 上实测的 `sha256sum` **全部一致**，可作为台账可信度的交叉验证；

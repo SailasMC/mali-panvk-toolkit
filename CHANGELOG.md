@@ -29,6 +29,11 @@
   → ★★ 独立探针：驱动渲染被证明 · 交换链三路全 VK_SUCCESS · 原假设不能复现
   → ★★ 掉线真身 = kbase CSF fatal exception 0xc3（发生在执行 draw 时）
   → 首要目标转向：查 CSF exception 0xc3
+  → v50 上机：首次真交换链(2376x1080, imageCount=3) + 主界面干净渲染约 10s(不花屏/不乱跳/不撕裂)
+  → v51 空载荷 APK(unzip 匹配失败) ⇒ 废弃，勿用
+  → v52 = v50 载荷 + 全套调试 env ⇒ 落盘 logcat 抓到 kbase CSF group 0 tiler heap OOM
+  → v53(P1) 补 uAPI 1.18 档 + csi_handlers ⇒ ★ 真机无效 ✗(无 TILER_OOM CSI handler 行)
+  → 下一步：P2(接上 tiler heap renew，治「只涨不落」)
 ```
 
 ---
@@ -492,6 +497,63 @@ v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**
 
 ---
 
+## M13 · v50 上机（首次真画面）· v51 废弃 · v52 抓到 tiler heap OOM · v53(P1) **无效 ✗**
+
+### M13.1 v50 上机：★ **首次出现真交换链 + 真画面**（证据 `docs/09 §28.4`）
+
+删掉 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`（与 v49 的**唯一自变量差异**）后：
+
+- MGL 日志**首次出现真交换链**：`Swapchain created, extent = 2376x1080, swapchain imageCount = 3`；
+- 判据行仍达成：`OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)`；
+- ★ **用户实测**：**MC 主界面（含 3D 全景）正常渲染约 10 秒、画面干净**
+  （**不花屏 / 不乱跳 / 不撕裂**），之后**黑屏并崩溃**；日志
+  `vkQueuePresentKHR` / `vkAcquireNextImageKHR` → **`-4`**。
+- ⇒ `-4` 只是**从「约 2 秒」推迟到「约 10 秒」**，**并未消除**；但它把「真交换链」这一步做实了。
+
+### M13.2 v51（`5.1-wsi-patched-debug`）：**空载荷 APK ⇒ 废弃，勿用**（证据 `docs/09 §26.1`）
+
+打包时 `unzip` 匹配载荷条目失败 ⇒ 产物里**只剩 manifest / `resources.arsc` / `classes.dex` / 签名**，
+**一条 `lib/arm64-v8a/*` 都没有**（size **8,595 B**、sha256 `6e9ce7d2…b0313`），
+而 `apksigner verify` **仍然通过**。
+⇒ 教训：打包后必须 `unzip -l` 数载荷条目 + `unzip -p … | sha256sum` 与源件比对（v53 已据此加固）。
+
+### M13.3 v52（`5.2-wsi-patched-debug`）：v50 载荷 + 全套调试 env ⇒ ★ **抓到决定性一行**（证据 `docs/09 §26.2/§28.5`）
+
+- v52 = **v50 载荷一字节不改** + `MESA_DEBUG=1` / `PANVK_DEBUG=1` / `LIBGL_DEBUG=1` /
+  `EGL_LOG_LEVEL=debug` / `MOBILEGL_LOG_FILE_PATH=/sdcard/MG/mgl.log`；sha256 `0bbef030…`；
+  `MESA_VK_WSI_HEADLESS_SWAPCHAIN` 出现次数 = 0（已核）。
+- ★ **关键教训（方法论）**：**logcat 环形缓冲会冲掉证据** ——
+  前期日志量极大（`PANVK_DEBUG` + `LIBGL_DEBUG`），事后 `logcat -d` 回读时那行**已经不在缓冲区**。
+  ⇒ 治本做法 = **起进程前就后台落盘**：`logcat -b all -v time > /data/local/tmp/cap.txt`。
+  另记一条自杀式命令：`pkill -f "<模式里含自身命令行的字符串>"` 会把**执行它的 shell 自己**杀掉
+  ⇒ 要用 **`pkill -x logcat`**。
+- 抓到的决定性一行：`E/MESA: kbase: CSF group 0 tiler heap OOM notification`；
+  **时间线**：判据行 → **+5~10 s** 该行 → **+9 s** `VK_ERROR_DEVICE_LOST`。
+
+### M13.4 v53（`5.3-p1-tiler-oom-csi`，P1）：补 uAPI 1.18 档 + `csi_handlers` ⇒ ★ **真机无效 ✗**
+
+（证据 `docs/09 §27`/§28.6、[`research/16`](research/16-p1-p2-implementation.md)）
+
+- 改动**唯一一处**：`kbase_kmod.c` 的 `kbase_kmod_csf_group_create()`，
+  版本阶梯 `1.25 / 1.6` → **`1.25 / 1.18 / 1.6`**；新增 1.18 档 =
+  ioctl **`0xc028803a`**（58）、结构体 **40 B**、置 `csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG`；
+  uAPI 判断原样保留、`<1.18` 老路径不变（1.6 兜底仍在最后）。
+- 产物：新 `.so` size **20,005,600** / md5 **`7f3a0e8f…b404`** / sha256 **`58ef996f…bec4`**；
+  v53.apk sha256 **`9c99af82…d48e`**；增量编译 `NINJA_EXIT=0`；
+  **反汇编确认新分支真的进了二进制**（`0xc028803a` + `csi_handlers(29)=1`）。
+- ★ **真机结果：无效 ✗** —— 仍出现 `kbase: CSF group 0 tiler heap OOM notification`，
+  且**没有**出现期望的 `kbase: created CSF group N with TILER_OOM CSI handler (1.18 layout, ioctl 58)`
+  ⇒ **推断 1.18 分支被版本门挡住、根本没走到**（⚠️ 另外两条分支日志——1.25 档成功行 / 1.6 兜底行——
+  本轮**无记录**，标为**未验证**）。
+- ⇒ **P1 单独不够**：[`research/14`](research/14-tiler-heap-oom.md) 已定案
+  **「tiler heap 只涨不落」才是 OOM 的直接成因**（`kbase_renew_tiler_heap()` 是死代码）
+  ⇒ **下一步 = P2**（[`research/16`](research/16-p1-p2-implementation.md) §6 / [`research/14`](research/14-tiler-heap-oom.md) Fix B1）。
+
+> **产物台账**：v50–v53 的文件名 / 大小 / sha256 见 [`MANIFEST.md`](MANIFEST.md) §B 与 §E.1。
+
+---
+
+
 ## 附：本仓库**如实记录**的未解项（不隐藏）
 
 | # | 未解项 | 依据 |
@@ -504,8 +566,9 @@ v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**
 | U7 | `research/09` 无中文摘要 | [`research/README.md`](research/README.md) §3 |
 | U9 | `docs/09 §15` 的"被 `patchelf` 改过 `DT_NEEDED` 的 MGL 被提前加载"是**假设**，未被证实 | `docs/09 §15` |
 | U11 | **`O_RDONLY` 下 `DMA_HEAP_IOCTL_ALLOC` 是否成功 / `kbase_kmod_supports_dmabuf()` 的实际返回值**：本轮只做了源码推断（"必然失败"），未在设备侧取证；`research/06` 的注释给出的是**相反**推断 | `docs/09 §23.3` |
-| U12 | **v50（真 Android 交换链补丁）从未在真机运行** ⇒ 只有静态/链接层验证，无运行时证据；`-4` 也不能声称已消除 | `docs/09 §24.5`、`research/11` §7 |
+| U12 | **v50（真 Android 交换链补丁）** ⇒ ✅ **已上机**（`docs/09` §28.4：真交换链 + 主界面干净渲染约 10 秒）；⚠️ `-4` 仍在（该补丁不解决它） | `docs/09 §24.5`、`research/11` §7 |
 | U13 | **可复现的 `-1000072003` 只在 AHB `IMPLEMENTATION_DEFINED(0x22)` 上出现**（`Failed to get u_gralloc_buffer_basic_info`）；真实 App 的 Surface 用的正是该格式 ⇒ 与 U1 是**两条独立线** | `docs/09 §25.5`、`research/12` §6 |
+| U14 | ★ **tiler heap OOM 线（真实 App 现场的唯一直接拦路者）**：`E/MESA: kbase: CSF group 0 tiler heap OOM notification` → +9 s `-4`；**P1（v53）已上机验证无效 ✗**（仍 OOM、无 `TILER_OOM CSI handler (1.18 layout, ioctl 58)` 行）⇒ 根因按 `research/14` = **堆只涨不落**（`tiler_work_estimate` 全树无生产者 ⇒ `kbase_renew_tiler_heap()` 是死代码）；**下一步 P2** | `docs/09 §27/§28.5/§28.6`、`research/14`、`research/16` |
 
 **✅ 本轮已闭合（从上方未解项中移出）**
 
@@ -514,6 +577,7 @@ v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**
 | ~~U4~~ | `research/05` 与 `research/06` 对"出厂 `.so` 出自哪个 build 目录/哪套 platforms"的**矛盾** | ✅ **已闭合**：md5 + `strings` 实测判定 —— 4 个 build 目录中**只有 `/root/zenithblue/build/android-v4` 有产物**；`strings <so> \| grep -c wsi_x11` = **0**、`build.ninja` 中 x11 = **0** 次、meson `platforms=['android']` ⇒ **05 号对、06 号的"出厂件含 x11 WSI"不成立**（`android-deps-x11` 只是 include 目录名）。见 `docs/09 §24.4`、`research/11` §1 |
 | ~~U8~~ | `research/10` 探针未上机；`research/05` 方案 A 未上机 | ✅ **探针已上机**（8 模式，见 `docs/09 §25`、`research/12`）；**方案 A 已实施并编入 v50**（见 `docs/09 §24`、`research/11`）——但 v50 本身仍未上机（保留为 **U12**） |
 | ~~U10~~ | v48/v49/v50 的运行结果无记录（`docs/09` 止于 §22/v47） | ✅ **已闭合**：`docs/09` 新增 **§23（v48/v49）**、**§24（v50）**、**§25（探针 8 模式）**，本文件新增 **M12** |
+| ~~U12~~ | v50（真交换链补丁）从未在真机运行 | ✅ **已上机**：`Swapchain created, extent = 2376x1080, swapchain imageCount = 3` + 主界面（含 3D 全景）干净渲染约 10 秒（`docs/09 §28.4`）；⚠️ `-4` 仍在 |
 
 > **未闭合项的口径**：v50 的实机运行（U12）与 dma_heap 的 `O_RDONLY`/ALLOC 判定（U11）
 > 是**本轮唯一新增的两个未知**；其余未解项与上一版一致，未被本轮证据触及。

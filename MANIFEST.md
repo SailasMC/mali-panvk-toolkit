@@ -69,7 +69,7 @@
 
 ---
 
-## B 前史与后续（`v12`–`v15`、`v50`）
+## B 前史与后续（`v12`–`v15`、`v50`–`v53`）
 
 | 版本 | versionName | 大小 (B) | sha256(前16) | 说明 |
 |---|---|---|---|---|
@@ -77,7 +77,10 @@
 | v13 | — | 10,379,823 | `61b45ee2c38396bd` | v12 之后的迭代（**用途无记录**） |
 | v14 | `1.4-panvk` | 14,688,889 | `c7cde6b8581b0cd0` | 把**裸 ICD** 放进插件 lib 目录 ⇒ **JVM 卡死在 `JLI_Launch`**（`docs/09` §9②、§13 的原始事故） |
 | v15 | `1.5-panvk-rollback` | 10,379,823 | `f7fb5ecd9d640fdd` | 上述事故的**回滚版**（注意：回滚也必须**递增 `versionCode`**，降级安装会被 `INSTALL_FAILED_VERSION_DOWNGRADE` 拒绝，`docs/09` §9） |
-| v50 | `5.0-wsi-patched` | 10,187,311 | `677d81eb29c7c579` | **判据行之后的"真 Android 交换链版"**：载荷换成**新的 `libvulkan_panfrost.so`**（改名 `libvulkan_freedreno.so`，size 20,005,320 / md5 `e08e0764…` / sha256 `a0b2451e…`）+ v49 的 `libMobileGL.so` + `classes.dex`；`pojavEnv` 含 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`、`MESA_DEBUG=1`、`PANVK_DEBUG=1`、`PANVK_GRALLOC_NO_FALLBACK=0`、`PANVK_GRALLOC_NO_INFER_LINEAR=0`，**且已删掉 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**（与 v49 的**唯一自变量差异**）。打包脚本见 [`source/pack/pack_v50.sh`](source/pack/pack_v50.sh)。**运行结论**：[`docs/09 §24`](docs/09-mobilegl-integration.md)（补丁范围 / 产物哈希 / **构建目录实测判定**，`research/11`）+ [`docs/09 §25`](docs/09-mobilegl-integration.md)（探针 8 模式，`research/12`）——**唯一致命注意**：**本 APK 从未在真机运行过**，补丁只有静态/链接层验证；而探针已独立证明"原假设（交换链建不起来）不能复现"，真正让 GPU 掉线的是**执行 draw 时的 CSF exception `0xc3`** |
+| v50 | `5.0-wsi-patched` | 10,187,311 | `677d81eb29c7c579` | **判据行之后的"真 Android 交换链版"**：载荷换成**新的 `libvulkan_panfrost.so`**（改名 `libvulkan_freedreno.so`，size 20,005,320 / md5 `e08e0764…` / sha256 `a0b2451e…`）+ v49 的 `libMobileGL.so` + `classes.dex`；`pojavEnv` 含 `PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`、`MESA_DEBUG=1`、`PANVK_DEBUG=1`、`PANVK_GRALLOC_NO_FALLBACK=0`、`PANVK_GRALLOC_NO_INFER_LINEAR=0`，**且已删掉 `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**（与 v49 的**唯一自变量差异**）。打包脚本见 [`source/pack/pack_v50.sh`](source/pack/pack_v50.sh)。**运行结论**：[`docs/09 §24`](docs/09-mobilegl-integration.md)（补丁范围 / 产物哈希 / **构建目录实测判定**，`research/11`）+ [`docs/09 §25`](docs/09-mobilegl-integration.md)（探针 8 模式，`research/12`）——**唯一致命注意**：**本 APK 从未在真机运行过**，补丁只有静态/链接层验证；而探针已独立证明"原假设（交换链建不起来）不能复现"，真正让 GPU 掉线的是**执行 draw 时的 CSF exception `0xc3`**。**运行结论（已上机，[`docs/09 §28.4`](docs/09-mobilegl-integration.md)）**：删掉 headless 开关后**首次出现真交换链**（MGL 日志 `Swapchain created, extent = 2376x1080, swapchain imageCount = 3`）+ **用户实测主界面（含 3D 全景）干净渲染约 10 秒**（不花屏/不乱跳/不撕裂），之后黑屏崩溃（`vkQueuePresentKHR` / `vkAcquireNextImageKHR` → `-4`） |
+| v51 | `5.1-wsi-patched-debug` | 8,595 | `6e9ce7d261b07b99` | **空载荷 APK ⇒ 已废弃，勿用**：打包时 `unzip` 匹配载荷条目失败，产物里**只剩 manifest / `resources.arsc` / `classes.dex` / 签名**，**一条 `lib/arm64-v8a/*` 都没有**（`apksigner verify` 却**通过**）。教训：必须数载荷条目 + `unzip -p … \| sha256sum` 与源件比对（[`docs/09` §26.1](docs/09-mobilegl-integration.md)） |
+| v52 | `5.2-wsi-patched-debug` | 10,187,311 | `0bbef03083e74cfb` | **v50 载荷（一字节不改）+ 全套调试 env**（`MESA_DEBUG=1` / `PANVK_DEBUG=1` / `LIBGL_DEBUG=1` / `EGL_LOG_LEVEL=debug` / `MOBILEGL_LOG_FILE_PATH=/sdcard/MG/mgl.log`；`MESA_VK_WSI_HEADLESS_SWAPCHAIN` 出现次数 = 0）。**运行结论**（[`docs/09` §28.5](docs/09-mobilegl-integration.md)）：复现「约 10 秒干净画面后黑屏崩溃」，**后台落盘 logcat** 抓到 `E/MESA: kbase: CSF group 0 tiler heap OOM notification`（判据行 → +5~10 s 该行 → +9 s `-4`） |
+| v53 | `5.3-p1-tiler-oom-csi` | 10,187,311 | `9c99af82d51b54c3` | **P1**：`kbase_kmod.c` 的 CSF group create 补 **uAPI 1.18 档**（ioctl 58 = `0xc028803a`、40 B、`csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG`）；载荷 = 新 `.so`（size 20,005,600 / md5 `7f3a0e8f…` / sha256 `58ef996f…`）；env 与 v52 逐字符一致（`aapt2 dump` diff 为空）。**运行结论**（[`docs/09` §27.3](docs/09-mobilegl-integration.md)/§28.6）：★ **无效 ✗** —— 仍出现同一条 tiler heap OOM 通知，且**没有**出现期望的 `TILER_OOM CSI handler (1.18 layout, ioctl 58)` ⇒ 推断 1.18 分支被版本门挡住；**P1 单独不够，下一步 P2**（[`research/14`](research/14-tiler-heap-oom.md) Fix B1 / [`research/16`](research/16-p1-p2-implementation.md) §6） |
 
 ---
 
@@ -117,6 +120,13 @@
 | [`source/pack/AndroidManifest.v46.xml`](source/pack/AndroidManifest.v46.xml) | 1,439 | `22310107ed2eb6cd` | `/root/v46/AndroidManifest.xml` —— **插件清单模板**（`fclPlugin` / `renderer` / `pojavEnv` / `des` / `minMCVer`） |
 | [`research/11-wsi-patch-implementation.md`](research/11-wsi-patch-implementation.md) | 22,910 | `ea1444069d6c534a` | `/root/research/11-wsi-patch-implementation.md` —— **v50 WSI 补丁实施报告**（3 文件 diff 摘要 + 产物哈希 + ★ 构建目录实测判定，闭合 U4）。另逐字收录三份 diff 原文：[`11-diff-src_util_u_gralloc_u_gralloc_fallback.c.txt`](research/11-diff-src_util_u_gralloc_u_gralloc_fallback.c.txt)（4,453 B）/ [`11-diff-src_vulkan_runtime_vk_android.c.txt`](research/11-diff-src_vulkan_runtime_vk_android.c.txt)（8,272 B）/ [`11-diff-src_android_stub_nativewindow_stub.cpp.txt`](research/11-diff-src_android_stub_nativewindow_stub.cpp.txt)（1,084 B） |
 | [`research/12-probe-run-results.md`](research/12-probe-run-results.md) | 19,911 | `794b1236fbbce55c` | `/root/research/12-probe-run-results.md` —— ★★ **真机探针 8 模式结果**（渲染被独立证明 / 原假设不能复现 / `-4` = CSF `0xc3`） |
+| [`research/13-csf-exception-c3.md`](research/13-csf-exception-c3.md) | 34,390 | `cd72b69e0d91ab73` | `/root/research/13-csf-exception-c3.md` —— ★ **CSF `0x7dc002c3`/`0xc3` 定位报告**（= GPU MMU `AS_FAULTSTATUS` 原值：TRANSLATION_FAULT_3 + CSF LSU 的 READ；触发面 = 真 `vkCmdDraw` 碰 tiler heap） |
+| [`research/14-tiler-heap-oom.md`](research/14-tiler-heap-oom.md) | 40,079 | `9f3a2c9473def8a5` | `/root/research/14-tiler-heap-oom.md` —— ★ **tiler heap OOM 定案**（堆只涨不落 + 10 秒黑洞 = `KBASE_WAIT_TIMEOUT_NS` + 两处最小修法 A/B） |
+| [`research/15-panvk-mtk-diff.md`](research/15-panvk-mtk-diff.md) | 30,083 | `f8728e0abc83c074` | `/root/research/15-panvk-mtk-diff.md` —— 与先例 `/root/panvk-mtk`（实为 `/root/mesa` 的补丁仓库）的彻底 diff；H1/H2 两条可移植差异 |
+| [`research/16-p1-p2-implementation.md`](research/16-p1-p2-implementation.md) | 21,322 | `412e7e3387734edb` | `/root/research/16-p1-p2-implementation.md` —— ★ **P1 落地报告（v53）**：uAPI 1.18 档 + `csi_handlers`、产物哈希、反汇编取证、**真机无效 ✗**、P2 补丁草案 |
+| [`research/attachments/16/16-p1.diff`](research/attachments/16/16-p1.diff) | 4,163 | `cbc71b17bca8c94f` | P1 的 unified diff（备份件→现件，85 行） |
+| [`research/attachments/16/16-p1-build.log`](research/attachments/16/16-p1-build.log) | 279 | `d36a55452fd38393` | P1 增量编译 ninja 全文（`NINJA_EXIT=0`，只重编 `kbase_kmod.c` + 重链） |
+| [`research/attachments/16/16-p1-layout-check.c`](research/attachments/16/16-p1-layout-check.c) | 2,088 | `49e0408263a785fc` | ABI/字段偏移自证程序（`sizeof=40`、`offsetof(csi_handlers)=29`） |
 | [`research/summaries/09-结论摘要.md`](research/summaries/09-结论摘要.md) | 7,836 | `df011e384b7ef182` | 09 号（真实世界先例）的**中文结论摘要** —— 补齐 `research/README.md` §3 记录的缺口 |
 
 > 签名用 keystore（`/root/dsh-driver.keystore`，别名 `dshdriver`，口令为脚本内明文 `android`）
@@ -182,6 +192,19 @@ d67a326c85c3620da9cc06d694e08d92639ab9cdc067476addf70a478e7f31da  panvk-shim.apk
 （共 **47** 个 `*.apk`；上表覆盖其中主线 39 个 + 其它 8 个。）
 
 ---
+
+### E.1 追加：`v51`–`v53` 的实测输出（2026-10-05）
+
+> 上面的 §E 是**当时那一次** `sha256sum *.apk` 的原始输出，**保持原样不改**；
+> v51–v53 是其后新增的产物，故单列于此（同机、同法实测）：
+
+```
+6e9ce7d261b07b996a6e60c80a5ad598f1e950b813716ff540c451283f8b0313  mgl-panvk-v51.apk
+0bbef03083e74cfb77be37efce18853eba0945857fd185ad3d7879e5eef61d23  mgl-panvk-v52.apk
+9c99af82d51b54c3ca7f97d1ffd206f5edad0f534490afa7c34be1dfc073d48e  mgl-panvk-v53.apk
+58ef996f9cfd5dbd88c37daea4f02bbde4fdee5818561526d21cf9adadefbec4  libvulkan_panfrost.so   (v53 驱动件，另存 /root/dist-v53/)
+```
+
 
 ## F 相关文件
 

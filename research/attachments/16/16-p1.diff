@@ -1,0 +1,85 @@
+--- /root/zenithblue/work/mesa/src/panfrost/lib/kmod/kbase_kmod.c.bak-1791171723	2026-10-05 11:42:03.123096853 +0800
++++ /root/zenithblue/work/mesa/src/panfrost/lib/kmod/kbase_kmod.c	2026-10-05 11:42:14.579290094 +0800
+@@ -514,12 +514,22 @@
+    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create) == 112);
+ 
+    /* Endpoint masks/maxes match what panfork uses on all CSF parts:
+-    * a single tiler unit, all fragment/compute endpoints.  Tiler heap growth
+-    * is serviced by the kernel OOM path, so no application CSI exception
+-    * handler is requested (BASE_CSF_TILER_OOM_EXCEPTION_FLAG was tried and
+-    * confirmed ineffective on this kernel: the group is terminated on an
+-    * unhandled OOM regardless).  On uAPI 1.25+ use the current ioctl layout
+-    * to ask the kernel to report recoverable CS faults through read(). */
++    * a single tiler unit, all fragment/compute endpoints.
++    *
++    * Experiment P1 (report 15, H1): ask the kernel for the *recoverable*
++    * tiler-OOM path by registering BASE_CSF_TILER_OOM_EXCEPTION_FLAG.  Without
++    * it kbase's handle_oom_event() always takes the fatal branch
++    * (term_queue_group() + report_tiler_oom_error()), which is exactly the
++    * "CSF group N tiler heap OOM notification" line seen on device, after
++    * which the group is dead.  With it the kernel requests incremental
++    * render and panvk's app-side CSI handler (tiler_oom_ctx.ir_scratch_fbd_ptr,
++    * gpu_queue.c) services the allocation.
++    *
++    * The flag only exists in the 1.18 layout (ioctl 58, 40-byte struct); the
++    * 1.6 fallback struct has no csi_handlers field at all.  The uAPI version
++    * checks below are therefore preserved unchanged: devices below 1.18 keep
++    * the legacy path and are not affected by this patch.
++    * On uAPI 1.25+ the current layout also carries the flag. */
+    if (pan_kmod_driver_version_at_least(&dev->driver, 1, 25)) {
+       union kbase_ioctl_cs_queue_group_create req = {
+          .in = {
+@@ -534,19 +544,49 @@
+             .fragment_max = 64,
+             .compute_max = 64,
+             .cs_fault_report_enable = 1,
++            .csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG,
+          },
+       };
+ 
+       if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &req) == 0) {
+          *group_handle = req.out.group_handle;
+-         mesa_logd("kbase: created CSF group %u with CS fault reporting",
+-                   *group_handle);
++         mesa_logi("kbase: created CSF group %u with TILER_OOM CSI handler "
++                   "(uAPI >= 1.25 layout)", *group_handle);
+          return 0;
+       }
+ 
+       mesa_logw("kbase: current CS_QUEUE_GROUP_CREATE failed: %s; "
+-                "falling back to the 1.6 ABI",
+-                strerror(errno));
++                "trying the 1.18 ABI", strerror(errno));
++   }
++
++   /* Experiment P1: uAPI [1.18, 1.25).  This is the only layout below 1.25
++    * that can carry csi_handlers, so try it before dropping to the flagless
++    * 1.6 ABI.  If the kernel rejects the 40-byte ioctl 58 we log and fall
++    * through exactly as before. */
++   if (pan_kmod_driver_version_at_least(&dev->driver, 1, 18)) {
++      union kbase_ioctl_cs_queue_group_create_1_18 req18 = {
++         .in = {
++            .tiler_mask = 1,
++            .fragment_mask = ~0ull,
++            .compute_mask = ~0ull,
++            .cs_min = cs_queue_count,
++            .priority = 0, /* BASE_QUEUE_GROUP_PRIORITY_HIGH */
++            .tiler_max = 1,
++            .fragment_max = 64,
++            .compute_max = 64,
++            .csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG,
++         },
++      };
++
++      if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_18, &req18) == 0) {
++         *group_handle = req18.out.group_handle;
++         mesa_logi("kbase: created CSF group %u with TILER_OOM CSI handler "
++                   "(1.18 layout, ioctl 58)", *group_handle);
++         return 0;
++      }
++
++      mesa_logw("kbase: 1.18 CS_QUEUE_GROUP_CREATE failed: %s; "
++                "falling back to the 1.6 ABI", strerror(errno));
+    }
+ 
+    /* The legacy request remains the compatibility fallback and leaves tiler

@@ -1365,3 +1365,210 @@ W MESA : kbase: received CSF CPU queue dump notification
 - 探针跑的是**补丁前**驱动（`4417b369`）⇒ §24 的 WSI 补丁**不参与**本节任何结论。
 - `render` 模式的 MESA 日志中**没有** `kbase:` 行（该模式的图像内存未走 dma-buf 路径），
   因此**不能**用本节日志判定 `DMA_HEAP_IOCTL_ALLOC` 的成败（见 23.3 的口径说明）。
+
+---
+
+## 26. v51/v52：调试取证链路（v51 已废弃）
+
+### 26.1 v51：**空载荷 APK ⇒ 已废弃，勿用**
+
+v51 的打包在**载荷注入**这一步出错：用 `unzip` 提取/替换待处理的载荷条目时**匹配失败**
+（父级现场记录），结果 zip 里**只剩 manifest / `resources.arsc` / `classes.dex` / 签名**，
+**一条 `lib/arm64-v8a/*` 都没有**（服务器 `/root/final/` 实测）：
+
+```
+$ unzip -l mgl-panvk-v51.apk
+  Length      Date    Time    Name
+     3504  1980-01-01 00:00   AndroidManifest.xml
+       40  1980-01-01 00:00   resources.arsc
+     1328  2026-10-05 11:03   classes.dex
+      412  2026-10-05 11:03   META-INF/DSHDRIVE.SF
+     1337  2026-10-05 11:03   META-INF/DSHDRIVE.RSA
+      285  2026-10-05 11:03   META-INF/MANIFEST.MF
+```
+
+size **8,595 B**（正常版 10,187,311 B）、sha256 `6e9ce7d2…b0313`（全值见 [`MANIFEST.md`](../MANIFEST.md) §B）。
+⇒ **v51 作废，不再作为任何实验的对照件**。
+
+> **教训（v53 已据此加固）**：打包后必须做**两条**载荷校验 ——
+> ①`unzip -l` 数一遍 `lib/arm64-v8a/*` 条目；②`unzip -p … lib/arm64-v8a/libvulkan_freedreno.so | sha256sum`
+> 与源件比对。**只看 `apksigner verify` 通过是不够的**（v51 的签名是**通过**的）。
+
+### 26.2 v52：v50 载荷 + 全套调试 env
+
+v52 = **v50 的载荷（一字节不改）** + 完整调试环境变量。sha256 `0bbef030…`（全值见 §B 台账）。
+env 最终形态（v53 沿用同一份，`aapt2 dump xmltree` 逐字符 diff 一致）：
+
+```
+LIBGL_ES=3:POJAV_RENDERER=opengles3:MOBILEGL_BACKEND_TYPE=DirectVulkan:MOBILEGL_ESPRYT_USE_ANGLE=0:
+MOBILEGL_MAGMA_R11G11B10F_FALLBACK=0:MOBILEGL_LOG_FILE_PATH=/sdcard/MG/mgl.log:
+MESA_DEBUG=1:PANVK_DEBUG=1:LIBGL_DEBUG=1:EGL_LOG_LEVEL=debug
+```
+
+`MESA_VK_WSI_HEADLESS_SWAPCHAIN` **未加回**（dump 里出现次数 = 0，已核）。
+
+### 26.3 ★ 关键教训一：**logcat 环形缓冲会冲掉证据**
+
+`libvulkan_freedreno.so` / MGL 的前期日志量极大（`PANVK_DEBUG=1` + `LIBGL_DEBUG=1`），
+**logcat 的环形缓冲会在崩溃前就把早期行挤掉** —— 包括我们要找的那一行
+（"主界面正常渲染约 10 s"这段窗口里的 `E/MESA` 行），用事后 `logcat -d` 回读时**已经不在缓冲区里**。
+
+⇒ **治本做法：起进程前就开后台落盘**：
+
+```bash
+adb shell "logcat -b all -v time > /data/local/tmp/cap.txt" &   # 或设备侧 setsid 起
+# 复现崩溃后
+adb shell "cat /data/local/tmp/cap.txt" > cap.txt
+```
+
+落盘文件不受环形缓冲影响，`-b all` 同时覆盖 `main/system/crash`，
+`-v time` 保证**时间线可对**（§28 的"判据行 → +5~10s OOM → +9s DEVICE_LOST"就是靠它对齐的）。
+
+### 26.4 ★ 关键教训二：`pkill -f "<模式>"` 会自杀
+
+清理旧 logcat 进程时，`pkill -f "<含自身命令行的模式>"` 会把**执行这条 `pkill` 的 shell 自己**
+匹配上（模式串就出现在它自己的 argv 里）并杀掉 ⇒ 现象是"命令没输出就断了"，
+很容易被误判成"设备/通道出问题"。
+
+⇒ **用 `pkill -x logcat`**（按**进程名**精确匹配，不匹配命令行）。
+
+---
+
+## 27. v53（P1）：CSF group create 走 uAPI 1.18 布局并置 `csi_handlers` —— **真机无效 ✗**
+
+### 27.1 改了什么（唯一一处，详见 [`research/16`](../research/16-p1-p2-implementation.md)）
+
+文件 `src/panfrost/lib/kmod/kbase_kmod.c` 的函数 `kbase_kmod_csf_group_create()`：
+版本阶梯从 `1.25 / 1.6` 两档补成 **`1.25 / 1.18 / 1.6`** 三档，**新增 1.18 档**：
+
+| 档（`driver.version`） | 结构体 | ioctl | `csi_handlers` |
+|---|---|---|---|
+| `>= 1.25` | 112 B | `0xc070803a` | 置 `BASE_CSF_TILER_OOM_EXCEPTION_FLAG` |
+| **`>= 1.18`（新增）** | **40 B** | **`0xc028803a`（= 58）** | **置 `BASE_CSF_TILER_OOM_EXCEPTION_FLAG`** |
+| `< 1.18` | 32 B | `0xc020802a`（1.6 兜底） | 老设备路径，**未动** |
+
+uAPI 判断（`pan_kmod_driver_version_at_least()`）**原样保留**；新分支失败会打
+`kbase: 1.18 CS_QUEUE_GROUP_CREATE failed: … falling back to the 1.6 ABI` 后**照旧落到 1.6**。
+
+**动机**（[`research/14`](../research/14-tiler-heap-oom.md) 独立得到同一结论，公开 kbase r43p0 支撑）：
+内核 `handle_oom_event()` 只在 `csi_handlers & BASE_CSF_TILER_OOM_EXCEPTION_FLAG`
+（且 `pending_frag_count==0`、`err ∈ {-ENOMEM,-EBUSY}`）时，才把 tiler OOM 当作**可恢复的增量渲染**
+交还固件；否则 `term_queue_group()` + `report_tiler_oom_error()` ——
+**正是我们抓到的那行 `kbase: CSF group N tiler heap OOM notification`，且此时组已被杀掉**。
+而 panvk 侧的 TILER_OOM handler **早就实现并注册好了**（增量渲染本体），**只是这个 flag 从未送达内核**。
+
+### 27.2 产物与静态验证（服务器实测）
+
+| 项 | 值 |
+|---|---|
+| 新 `.so` | size **20,005,600**，md5 **`7f3a0e8f8a2ec70d31f11fa6fe3ab404`**，sha256 **`58ef996f9cfd5dbd88c37daea4f02bbde4fdee5818561526d21cf9adadefbec4`** |
+| 旧件（v50/v52 在用） | size 20,005,320，md5 `e08e07645c16d8ebaa11ca70a09884fd` |
+| `mgl-panvk-v53.apk` | size 10,187,311，sha256 **`9c99af82d51b54c3ca7f97d1ffd206f5edad0f534490afa7c34be1dfc073d48e`** |
+
+- 增量编译 `NINJA_EXIT=0`（只重编 `kbase_kmod.c` + 一次重链，全文见 `research/attachments/16/16-p1-build.log`）；
+- ★ **反汇编确认新分支真的进了二进制**（不是只改到源码）：新 `.so` 里出现
+  `movk w1, #0xc028, lsl #16`（⇒ `0xc028803a`）与 `strb w8, [sp, #0x1d]`（⇒ `csi_handlers(29)=1`），
+  且 1.25 / 1.6 两档的门槛与 ioctl 常量（`0xc070803a` / `0xc020802a`）**原样保留**
+  （`llvm-objdump -d --disassemble-symbols=kbase_kmod_csf_group_create`，[`research/16`](../research/16-p1-p2-implementation.md) §2.1）；
+- ABI 字段偏移**二次自证**：`research/attachments/16/16-p1-layout-check.c`
+  （`sizeof=40`、`offsetof(csi_handlers)=29`、`KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_18=0xc028803a`）；
+- APK 载荷**逐位校验**：`unzip -p … lib/arm64-v8a/libvulkan_freedreno.so | sha256sum` = 新 `.so` 的 sha256
+  —— **非空载荷，已核**（针对 v51 的教训）。
+
+### 27.3 ★ 真机结果：**无效 ✗**
+
+真机装上 v53（其余一切与 v52 相同、**单变量**）后：
+
+- **仍然出现** `E/MESA: kbase: CSF group 0 tiler heap OOM notification`（与 v52 同一条）；
+- **没有出现**期望的 `kbase: created CSF group N with TILER_OOM CSI handler (1.18 layout, ioctl 58)`
+  —— 这是三条判据里唯一能证明"flag 送达内核"的正面证据。
+
+⇒ **推断：1.18 分支被版本门挡住、根本没走到** ——
+即协商到的 `driver.version` 使 `pan_kmod_driver_version_at_least(&dev->driver, 1, 18)` 为假，
+代码按阶梯落回 1.6 兜底（[`research/16`](../research/16-p1-p2-implementation.md) §8 的第 3 行口径）。
+**⚠️ 未验证**：本轮素材里**没有**另外两条分支日志（1.25 档成功行 / 1.6 兜底行）的记录，
+要钉死"到底走了哪一档"必须回读 `kbase_kmod.c` 里 `VERSION_CHECK_CSF` 协商出的版本值。
+（也不能反推成"内核拒收 40 B ioctl"—— 那会打 `1.18 … falling back to the 1.6 ABI`，素材里同样没有。）
+
+⇒ **结论：P1 单独不够。** [`research/14`](../research/14-tiler-heap-oom.md) 已给出更根本的一条：
+**「tiler heap 只涨不落」才是 OOM 的直接成因** ——
+Mesa 侧唯一的重置手段 `kbase_renew_tiler_heap()` 因
+`submit->tiler_work_estimate` **在全树没有任何写入点**而成为**死代码**（触发条件恒为假），
+堆只能单调涨到 `max_chunks=400` → `-ENOMEM` → 内核 `term_queue_group()` 杀组。
+⇒ **下一步 = P2**（接上 renew；最小 2 行版补丁草案见
+[`research/16`](../research/16-p1-p2-implementation.md) §6 / [`research/14`](../research/14-tiler-heap-oom.md) Fix B1）。
+
+---
+
+## 28. ★ 真机实测记录（v46–v53）
+
+> **口径**：本节只写**真机上真实发生的事**（含用户现场口述，已在条目内标明"用户实测"）。
+> 凡是**推断**一律标注；凡是**素材中没有**的一律写"无记录"，**不补**。
+> v46–v49 的版本定义见 [`MANIFEST.md`](../MANIFEST.md) §A，v50–v53 见 §B 台账。
+
+### 28.1 v46 / v47（headless 交换链）
+
+- **能出判据行**（v47，`MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`）：
+  `OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)`。
+- 但**约 2 秒后**在 `vkQueueSubmit(texture upload)` 上得到 **`VK_ERROR_DEVICE_LOST (-4)`**，
+  游戏随之崩溃（`docs/09` §22/§23.1）。
+- ⇒ 判据行达成**不等于**画面达成：headless 交换链的 `queue_present` 是空操作。
+
+### 28.2 v48（仅加调试 env）
+
+- 症状与 v47 **完全相同**；价值在于**第一次**把 `-4` 定位到
+  MGL 的**纹理上传批次** `vkQueueSubmit`（`VkTextureManager.cpp`），
+  且该链**不创建 AHB、不经过 `u_gralloc`、也不经过任何 WSI 代码**（`docs/09` §23.1）。
+
+### 28.3 v49（`PANVK_KBASE_DMA_HEAP=/dev/null/nonexistent`）
+
+- **无效 ✗**：错误码、错误位置**与 v48 逐字相同**，`-4` 照旧（`docs/09` §23.2）。
+- ⇒ 反向对照成立：**dma-heap / dma-buf 不是该 `-4` 的成因**。
+
+### 28.4 v50（WSI 补丁、删掉 headless hack）—— **首次出现真交换链**
+
+- v50 = v49 的载荷换成 WSI 补丁后的新 `.so`，**唯一自变量差异 = 删掉
+  `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1`**（`docs/09` §24.3）。
+- **MGL 日志首次出现真交换链**：
+
+```
+Swapchain created, extent = 2376x1080, swapchain imageCount = 3
+```
+
+- **判据行仍然达成**（同一行原文）：
+  `OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)`。
+- ★ **用户实测**：**MC 主界面（含 3D 全景）正常渲染约 10 秒、画面干净**
+  （**不花屏 / 不乱跳 / 不撕裂**），之后**黑屏并崩溃**；
+  日志里 `vkQueuePresentKHR` / `vkAcquireNextImageKHR` 返回 **`-4`**。
+- ⇒ 这是本项目**第一次**看到"真交换链 + 真画面"，
+  但 `-4` 只是**从"2 秒"推迟到"约 10 秒"**，并未消除。
+
+### 28.5 v52（v50 + 调试 env）
+
+- 复现现象与 v50 **相同**（一样约 10 秒干净画面后黑屏崩溃）。
+- 用 §26.3 的**后台落盘 logcat** 抓到了决定性的一行：
+
+```
+E/MESA: kbase: CSF group 0 tiler heap OOM notification
+```
+
+- **时间线**（落盘 logcat，`-v time`）：
+  **判据行 → +5~10 s 该 OOM 行 → +9 s `VK_ERROR_DEVICE_LOST`**。
+- ⇒ 从此把"10 秒黑洞"与 **tiler heap OOM** 挂上了钩
+  （[`research/14`](../research/14-tiler-heap-oom.md) §1.1 记录的两个绝对时刻
+  `11:25:37.423` → `11:25:47.413` 正好 **9.99 s**，与 `KBASE_WAIT_TIMEOUT_NS` 一致）。
+
+### 28.6 v53（P1：CSF group create 1.18 档 + `csi_handlers`）
+
+- **无效 ✗** —— 详见 §27.3：仍出现同一条 tiler heap OOM 通知，
+  且**没有**出现期望的 `TILER_OOM CSI handler (1.18 layout, ioctl 58)`。
+- ⇒ 推断 1.18 分支被版本门挡住；**P1 单独不够**，下一步 **P2**（接上 tiler heap renew）。
+
+### 28.7 本轮**没有**做成的事（如实）
+
+- v51 **是空载荷 APK**（§26.1），因此 **v51 没有任何真机结果**；
+- v46–v53 的**完整 logcat 原文**未逐字归档 —— 本节的引用均为**关键行 + 时间线**；
+  更早的原始日志只在服务器 `/root/research/` 的对应报告与父级会话中；
+- `-4` 与 §25 探针抓到的 **CSF exception `0xc3`** 是**两条不同的病灶**
+  （`0xc3` = CSF LSU 的 `TRANSLATION_FAULT_3`，见 [`research/13`](../research/13-csf-exception-c3.md)；
+  tiler heap OOM = §28.4–§28.6 这条线），**不要合并看**。

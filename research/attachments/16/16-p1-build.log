@@ -1,0 +1,5 @@
+[1/19] Generating src/git_sha1.h with a custom command
+[2/4] Compiling C object src/panfrost/lib/kmod/libpankmod_lib.a.p/kbase_kmod.c.o
+[3/4] Linking static target src/panfrost/lib/kmod/libpankmod_lib.a
+[4/4] Linking target src/panfrost/vulkan/libvulkan_panfrost.so
+NINJA_EXIT=0
