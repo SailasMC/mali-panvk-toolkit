@@ -1,0 +1,35 @@
+--- /root/zenithblue/work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c.bak-1791176223	2026-10-05 12:57:03.131764420 +0800
++++ /root/zenithblue/work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c	2026-10-05 13:11:11.398196947 +0800
+@@ -710,15 +710,31 @@
+ 
+    /* Active queues can consume a userspace doorbell without an ioctl.  Check
+     * CS_ACTIVE again after ringing it; if a suspend raced the write, the
+-    * scheduler kick below safely resumes the group. */
++    * scheduler kick below safely resumes the group.
++    *
++    * CS_ACTIVE is written by the firmware/kernel into the GPU-owned output
++    * page, so the CPU data cache may still hold a stale copy of it.
++    * kbase_gpu_wmb() is only "dsb sy" (see gpu_queue.c:148-157) and does NOT
++    * invalidate anything: reading *active without an invalidate can see a
++    * stale non-zero value, skip the kick below, and drop this submission's
++    * wake-up until the wait watchdog gives up (the 10 s "timeout on
++    * subqueue" with "extract halted, insert > extract").  Keep the fast
++    * path -- deleting it and kicking unconditionally triggers a hard CSF
++    * firmware fault on this GPU (0xc3 MMU translation fault) -- but make the
++    * read honest: invalidate the CS_ACTIVE cache line before every read,
++    * exactly as kbase_subqueue_wait_seqno() does for the seqno cell
++    * (gpu_queue.c:804).  Nothing in this page is CPU-dirtied (the whole
++    * output page is written by the firmware), so dc civac cannot lose data. */
+    kbase_gpu_wmb();
+    uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
+    volatile uint32_t *active =
+       (volatile uint32_t *)(output_page + CS_USER_IO_OUTPUT_CS_ACTIVE);
+ 
++   kbase_cache_invalidate_range((const void *)active, sizeof(*active));
+    if (*active) {
+       *(volatile uint32_t *)subq->kbase.user_io = 1;
+       kbase_gpu_wmb();
++      kbase_cache_invalidate_range((const void *)active, sizeof(*active));
+       if (*active)
+          return;
+    }

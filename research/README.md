@@ -6,16 +6,20 @@
 
 - 每篇 `NN-*.md` 都是一份**可独立阅读的技术报告**，含源码位置与实测证据；
 - `summaries/` 是各篇的**中文结论摘要**（决策用，比正文短得多）；
-- `attachments/` 是报告的**原始附件**（diff / 构建日志 / 校验程序），从 16 号起启用；
+- `attachments/` 是报告的**原始附件**（diff / 构建日志 / 校验程序），从 16 号起启用（**按报告号分子目录**）；
 - `paper.md` 是把 01–12 综合而成的**综述论文**；
 - `00-paper-skeleton.md` 是 `paper.md` 的原始骨架（保留作为写作过程记录）。
 
 > **状态口径**：本目录是这条研究线的**唯一权威记录**。
 > 凡是"未验证"的推断，正文与摘要都已如实标注，`paper.md` 沿用同一口径。
+> ⚠️ **17–31 号尚未并入 `paper.md`**（该论文仍止于 01–12 的 6 次错误点迁移）；
+> 17–31 覆盖的是**第 7 次迁移之后**的完整战役（tiler heap OOM → C2/P2 决定性修复 → `CALL` 卡住），
+> 与工程实录 [`docs/09 §23–§34`](../docs/09-mobilegl-integration.md)、
+> 里程碑 [`CHANGELOG.md` M12–M14](../CHANGELOG.md) 互为对照。
 
 ---
 
-## 1. 正文（16 篇，服务器 `/root/research/` 原样收录）
+## 1. 正文（31 篇，服务器 `/root/research/` 原样收录）
 
 | # | 文件 | 标题 | 一句话主题 | 结论要点 | 状态 |
 |---|---|---|---|---|---|
@@ -35,6 +39,21 @@
 | 14 | [`14-tiler-heap-oom.md`](14-tiler-heap-oom.md) | tiler heap OOM 定案 | 为什么 grow 没发生 + 最小可行修法 | ★ **OOM 通知是"验尸报告"**：kbase 在送通知**之前**就已 `term_queue_group()`；★ **grow"没成功"的真相 = 堆被顶到天花板且无人重置**：`initial_chunks=10`/`max_chunks=400`/`chunk_size=1 MiB`，而 Mesa 侧唯一的重置手段 `kbase_renew_tiler_heap()` **是死代码**（触发条件要求 `submit->tiler_work_estimate != 0`，而该字段**全树没有任何写入点**）⇒ 堆单调涨到 400 MiB → `-ENOMEM` → 杀组；★ **10 秒黑洞对上了**：OOM `11:25:37.423` → DEVICE_LOST `11:25:47.413` = **9.99 s** = `KBASE_WAIT_TIMEOUT_NS`；dma_heap 的 `O_RDONLY` **不是**本案凶手；两处最小修法 **(A)** 建 CSG 走 uAPI 1.18 布局并置 `csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG`、**(B)** 接上 renew（最小 2 行：去掉 `tiler_work_estimate` 前置条件） | ✅ 已定论（源码级 + 公开 kbase r43p0 支撑；**(A) 已实现为 v53 的 P1 并上机验证无效 ✗**，见 16） |
 | 15 | [`15-panvk-mtk-diff.md`](15-panvk-mtk-diff.md) | 与「已跑通先例 `/root/panvk-mtk`」的彻底 diff | 先例真实身份 + 两棵树的可移植差异 | ★ **先例身份被澄清**：`/root/panvk-mtk` 只是**补丁仓库**（单 commit，`patches/panvk_mtk.patch` + 构建脚本），源码真身是 `/root/mesa`（`funnymdzz/mesa@6598829`，未打补丁的原始态）；两树**同源同作者血脉**（注释逐字相同），`kbase_kmod.c` / `panvk_vX_gpu_queue.c` / `panvk_physical_device.c` 差异极小 ⇒ **先例的成功不能归因于任何一处 tiler 参数/workaround 的不同**；找出 **6 条**可移植差异，其中 **H1（`csi_handlers` 从未送达内核）最高**、**H2（`tiler_work_estimate` 生产者被整段删掉 ⇒ renew 永不执行）已定论** | ✅ 已定论（只读 diff） |
 | 16 | [`16-p1-p2-implementation.md`](16-p1-p2-implementation.md) | P1 落地报告（v53） | CSF group create 走 uAPI 1.18 布局并置 `csi_handlers` | 版本阶梯 `1.25/1.6` → **`1.25/1.18/1.6`**（新增 1.18：ioctl **`0xc028803a`**、结构体 40 B、`csi_handlers = BASE_CSF_TILER_OOM_EXCEPTION_FLAG`；uAPI 判断原样保留、`<1.18` 老路径不变）；新 `.so` size **20,005,600** / md5 **`7f3a0e8f…b404`** / sha256 **`58ef996f…bec4`**；**反汇编确认新分支进二进制**；v53.apk sha256 **`9c99af82…d48e`**；载荷逐位校验非空；**P2 未实施**（一次只改一个自变量，v52 就是现成对照）；附 ABI 偏移自证、回滚三步、并发冲突提示 | ✅ 已实现+编译+打包+静态验证；★ **真机验证：无效 ✗**（仍 OOM、无 `TILER_OOM CSI handler (1.18 layout, ioctl 58)` ⇒ 推断 1.18 分支被版本门挡住，见 `docs/09 §27.3`） |
+| 17 | [`17-p2-implementation.md`](17-p2-implementation.md) | **v54 落地报告：接上 tiler heap renew（P2 / 修法 B）** | 去掉 `submit->tiler_work_estimate &&` 前置门，让 `kbase_renew_tiler_heap()` 真正触发 | ★ **P2 落地**：`kbase_tiler_submit_count` 按"每 N 次图形提交"推进（clear-only 不计）；新增 `PANVK_KBASE_HEAP_RENEW_INTERVAL` 开关（默认 128）与版本/分支诊断日志；产物 = v54 驱动 `a9cba64a…`（20 006 408 B）/ APK `860d0780…` | ✅ 已实现+编译+打包；★ **真机有效**（见 `docs/09 §31`） |
+| 18 | [`18-ring-dump-and-missing-logs.md`](18-ring-dump-and-missing-logs.md) | Ring dump 逐条解码 + v54 三条新日志为何没出 | kbase ring entry 的发射序列与"改了却没日志"的两种原因 | ★ **ring entry 指令级解码**：每个 entry 20 条单字指令（160 B = 20×8）、`CALL` 在第 14 条（+112 B）—— 这张解码表后被 `docs/09 §29.4/§31` 反复引用；并给出"三条新日志没出"的问题 A/B 判定（**后来被证明与"静默回落"同源**，见 `docs/09 §33.1`） | ✅ 已定论（只读解码） |
+| 19 | [`19-g720-driver-support-status.md`](19-g720-driver-support-status.md) | 「会不会是驱动本身有问题？」G720/panvk 支持状态最终判定 | funnymdzz/mesa 的验证目标覆盖范围 | **不是驱动本身的问题**：该 fork 是**活跃维护的 kbase 后端**，但其公开声明的验证目标 ≠ G720（uAPI 世代差一整档）；给出"跑通方二进制"的可移植性边界 | ✅ 已定论（负面排除） |
+| 20 | [`20-v55-working-driver-package.md`](20-v55-working-driver-package.md) | v55：把 wonderkast02 的 G720 先例驱动打进我们的插件壳 | 先例驱动**到底能不能装上去** | ★ **提醒**：先例件是 Android **HAL 模块**（`hw_get_module`/`HMI`），**不是 JSON 可发现的桌面式 ICD** ⇒ v55 按任务书字面装上去**必定在 ICD 入口处失败**，**不要用它做判定**（会做成假阴性）；两个阻断点给出定论 | ✅ 已定论（装不上去 ≠ 病灶在设备侧） |
+| 21 | [`21-p5-modifier-fallback.md`](21-p5-modifier-fallback.md) | **P5 实施记录 —— MTK AFBC modifier 回退** | AHB modifier 从 LINEAR 改 AFBC（跑通方方向） | 跑通方铁律要求 AFBC **`0x0800000000000072`**（= `DRM_FORMAT_MOD_ARM_AFBC(32x8\|SPARSE\|SPLIT\|YTR)`）；开关 `PANVK_GRALLOC_AFBC_FALLBACK`（默认 1）；★ **真机 ⇒ `exception 0xc3`（MMU `TRANSLATION_FAULT_3`）⇒ 判定有害、已撤回** | ✗ **已证伪并撤回**（见 `docs/09 §32`） |
+| 22 | [`22-vertex-corruption-arch12.md`](22-vertex-corruption-arch12.md) | G720（arch **v12**）上「几何/顶点数据被读错」的定位 | 顶点属性打包是否与跑通方不同 | ★ **前提纠错**：顶点属性描述符（stride/format/offset/divisor）**不是**差异点；列出两条互相独立、可落地的候选改动并按可能性排序 | ✅ 已定论（只读定位；改动未上机） |
+| 23 | [`23-completion-timeout-crash.md`](23-completion-timeout-crash.md) | **10 秒完成超时 → `VK_ERROR_DEVICE_LOST` 定案报告** | 为什么 `vkWaitForFences` 恰好 10 s 后得 `-4` | ★ 六条结论：本机**无法启用完成/故障通知**（协议层）；`SYNC_ADD64` 唤醒路径逐行打点；把"环被取空"变成**不可信信号**；两个先例（panvk-mtk / G610）逐字对照 | ✅ 已定论（`KBASE_WAIT_TIMEOUT_NS` = 9.99 s 吻合） |
+| 24 | [`24-fix1-kick-implementation.md`](24-fix1-kick-implementation.md) | fix1 实施报告（无条件 kick 调度器）→ **v57** | 删掉"快速路径"是否解决超时 | ★ **无效**：无条件 kick 并未解决 10 s 超时 ⇒ 反证"快路径误判"这一假设；附 v57 产物哈希 | ✗ **已证伪**（见 `docs/09 §32`） |
+| 25 | [`25-cacheinvalidate-kick-fix.md`](25-cacheinvalidate-kick-fix.md) | CS_ACTIVE 缓存失效修复（保留快路径）→ **v58** | 读 GPU 写内存前是否漏了 cache invalidate | 在 `kbase_subqueue_publish()` 读 `*active` 前各加一条 `kbase_cache_invalidate_range()`（`:733`/`:737`，共 **2 行**）；★ **真机无效** ⇒ 缓存一致性不是该超时的成因 | ✗ **已证伪**（见 `docs/09 §32`） |
+| 26 | [`26-c1-heap-suppression.md`](26-c1-heap-suppression.md) | **C1：kbase 上抑制逐 render pass 的 tiler-heap 操作** → **v59** | 只留 `cs_vt_start`、抑制其余 heap 操作会怎样 | 6 处用 `cmdbuf_skips_gpu_heap_ops()` 守卫：不再发 `cs_vt_end`/`cs_finish_fragment`/`cs_frag_end`，且不再注册/撤销 **TILER_OOM** 处理器；★ **真机有害 ⇒ 流水线在第 3~4 个作业即卡死** | ✗ **已证伪并撤回**（见 `docs/09 §32`） |
+| 27 | [`27-v60-clean-c1.md`](27-v60-clean-c1.md) | **v60：干净单变量构建（v54 基线 + C1）** | 把 C1 单独隔离出来再判一次 | ★ **P5 与 v58 缓存失效全部撤回后**，v54 逐位基线 + C1（唯一新变量）⇒ **仍有害** ⇒ 确证"卡死"是 **C1 本身**，不是构建不干净 | ✗ **已证伪**（干净单变量版） |
+| 28 | [`28-v61-c1-plus-cacheinvalidate.md`](28-v61-c1-plus-cacheinvalidate.md) | v61 = 当前树（v60）+ v58 的两行缓存失效 | C1 与缓存失效叠加是否有救 | **无救**：两者叠加仍有害；本轮一次编译失败**未产出 `.o`**、未污染当时在用的 `.so`（报告内已如实标注） | ✗ **已证伪** |
+| 29 | [`29-v62-c2-tiler-wait.md`](29-v62-c2-tiler-wait.md) | **v62 = v61 + C2（上游 open MR `!44173`）** | 复用 tiler heap 前先等待自家 tiling 工作退休 | ★ C2 首次编入：`get_tiler_desc()` 内、取 VERTEX_TILER builder 之后插入 `cs_wait_slots(b, dev->csf.sb.all_iters_mask)`；★ **判据纪律**：C2 的**独有判据是归属注释 `upstream MR !44173`**，`cs_wait_slots(all_iters)` 的**计数不能单独作判据**（v54 本就有一处同形调用）；撤 C2 ⇒ 逐位 = `1915d16e…`（v61） | ✅ 已实现+编译；本轮未上机（效果见 30） |
+| 30 | [`30-v63-clean-c2.md`](30-v63-clean-c2.md) | **v63：v54 基线 + C2（干净单变量版本）** | 把 C1 与 v58 两行撤干净后，只留 C2 | ★ **确定性对照通过**：撤 C1 + 撤 v58 两行 ⇒ 重编**逐位 = `a9cba64a…`（20 006 408 B = v54）**；再只贴回 C2（429 B/10 行，与 v62 原块逐字节相同）⇒ `c03f0e7b…`（20 007 048 B），**二次重编逐位相同** | ✅ 已实现+编译+打包；★ **真机：存活跃升到分钟级**（`docs/09 §29.3`） |
+| 31 | [`31-v65-next-contract-fix.md`](31-v65-next-contract-fix.md) | **v65：kbase ring wrapper 不得抢占 PanVK 的 `SB_MASK_STREAM`** | v64 挂起的机制定位 + 下一处"与内核/固件契约不符"的点 | ★ **v64 三次挂起签名一致**：三个子队列的 ring `extract` **精确停在各自最后一条 ring entry 的 `CALL`**、`CS_ACTIVE=0`、`cell->error=0`、无 CS fault、无 TILER_OOM、10 s 内 20 次 rekick 一字节未动 ⇒ 机制 = **流切换（`CALL`）处的 CS 状态被卡**；v65 删掉 wrapper 重写 `SB_MASK_STREAM` 的 2 行；★ **并如实指出**：「2 分 51 秒」最长存活**不在 `cap.txt` 内、本轮无法复核** | ✅ 已实现+编译+打包+确定性对照；★ **v65 未上机**（在途） |
 
 ---
 
@@ -72,6 +91,16 @@
 | 目录 | 内容 |
 |---|---|
 | [`attachments/16/`](attachments/16/) | 16 号（P1/v53）的原始附件：[`16-p1.diff`](attachments/16/16-p1.diff)（P1 unified diff，85 行）、[`16-p1-build.log`](attachments/16/16-p1-build.log)（ninja 全文，`NINJA_EXIT=0`）、[`16-p1-layout-check.c`](attachments/16/16-p1-layout-check.c)（ABI/字段偏移自证程序） |
+| [`attachments/17/`](attachments/17/) | 17 号（P2/v54）：[`17-v54-gpu_queue.diff`](attachments/17/17-v54-gpu_queue.diff)、[`17-v54-kbase_kmod.diff`](attachments/17/17-v54-kbase_kmod.diff)（P2 的两份 diff）、`17-v53-manifest.txt` / `17-v54-manifest.txt`（`aapt2 dump` 清单原文） |
+| [`attachments/21/`](attachments/21/) | 21 号（P5/v56）：`21-v56-manifest.txt` |
+| [`attachments/24/`](attachments/24/) | 24 号（fix1/v57）：[`24-fix1.diff`](attachments/24/24-fix1.diff)、`24-v57-manifest.txt` |
+| [`attachments/25/`](attachments/25/) | 25 号（缓存失效/v58）：[`25-fix.diff`](attachments/25/25-fix.diff)、`25-v58-manifest.txt` |
+| [`attachments/26/`](attachments/26/)–[`attachments/30/`](attachments/30/) | C1 系列（v59/v60/v61）与 C2 系列（v62/v63）的 `aapt2 dump` 清单原文 |
+| [`attachments/31/`](attachments/31/) | 31 号（v65）：`31-v64-manifest.txt` / `31-v65-manifest.txt`（两版清单，**仅 versionCode/versionName 两行不同**）、`31-build-revert.log` / `31-build-v65-reapply.log`（**确定性对照**的两次 ninja 全文）、`31-v65.so.sha256`（`b9952f75…`） |
+
+> **附件纪律**：只收**文本**（`.diff` / `.txt` / `.log` / `.sha256`）。
+> 驱动 `.so`、APK 一律**不入库**（含 `31-work/v65-payload.so`）⇒ 其哈希登记在
+> [`MANIFEST.md`](../MANIFEST.md) §B.1 / §E.2（这本身就是仓库规则的一次实证）。
 
 ---
 

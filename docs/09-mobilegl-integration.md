@@ -1572,3 +1572,311 @@ E/MESA: kbase: CSF group 0 tiler heap OOM notification
 - `-4` 与 §25 探针抓到的 **CSF exception `0xc3`** 是**两条不同的病灶**
   （`0xc3` = CSF LSU 的 `TRANSLATION_FAULT_3`，见 [`research/13`](../research/13-csf-exception-c3.md)；
   tiler heap OOM = §28.4–§28.6 这条线），**不要合并看**。
+
+---
+
+## 29. ★★★ 里程碑：从「一画就崩」到「分钟级存活」（v54 → v63 → v64）
+
+> **本节口径**（遵循 [`README.md` §6.6](../README.md)）：凡**归档工件里能复核的**写"✅ 实测"；
+> 凡**只有会话现场口述、工件中取不到的**写"⚠️ 未复核"，**不补数字、不圆场**。
+> 本轮 `cap.txt` 在取证过程中被**轮转截断**（14:47 由 81 MB 截到 6.9 MB），
+> 因此下面引用的关键行是**当场摘录**留下的记录（这本身也成了一条教训，见 §33.3）。
+
+### 29.1 判据行与真交换链
+
+**判据行**（渲染器链路成立的唯一判据，原文）：
+
+```
+OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363, Driver 26.2.99)
+```
+
+**真 Android 交换链**（不再是 headless 空操作，MGL 日志原文）：
+
+```
+Swapchain created, extent = 2376x1080, swapchain imageCount = 3
+```
+
+### 29.2 版本链与两个决定性修复
+
+| 版本 | 定义 | 驱动 sha256 | 结果 |
+|---|---|---|---|
+| **v54** | `5.4-p2-tiler-heap-renew` —— 接上 tiler heap 续期（**P2**） | `a9cba64afa935370…`（20 006 408 B） | 生存从"秒级"升到"十秒级" |
+| **v63** | `6.3-v54-plus-c2` = **v54 逐位基线 + C2**（干净单变量） | `c03f0e7b7e391b20…`（20 007 048 B） | 生存跃升到**分钟级** |
+| **v64** | `6.4-fast-renew32` = **v63 + env `PANVK_KBASE_HEAP_RENEW_INTERVAL=32`**（驱动**逐位同 v63**） | 同 `c03f0e7b…` | ★ **消灭 tiler heap OOM** |
+
+⇒ **两个修复缺一不可**：C2（§30）解决"复用 tiler heap 前没等自家 tiling 工作退休"，
+P2 + 正确的续期区间（§31）解决"堆只涨不落"。**v64 = 两者的合取**。
+
+### 29.3 存活时间演进（★ 证据状态分栏）
+
+| 事实 | 状态 | 依据 |
+|---|---|---|
+| 判据行成立 | ✅ 实测 | 判据行原文（§22；本轮 v64 现场同样成立） |
+| 真交换链 `2376x1080 count=3` | ✅ 实测 | MGL 日志原文（§28.4；v64 现场 `14:19:45.447` 同一行） |
+| 另一次运行 `count=4` | ✅ 实测 | 归档 `cap.txt`：`14:21:33.210` `swapchain imageCount = 4`（PID 24170） |
+| **P2 消灭 OOM** | ✅ 实测 | 归档 `cap.txt` 的 **13:05–14:47 全窗口 0 次** `tiler heap OOM`（v52/v53 时代同一条通知是常客，§28.5/§28.6） |
+| 三次真机运行的进程存活 | ✅ 实测 | `cap.txt`：**55.2 s**（PID 22794）· **82.2 s**（PID 24170）· **50.2 s**（PID 25236）；渲染期最长的一次 **68 s 无 `-4`**（PID 24170） |
+| 存活演进 ≈3 s → 12 s → 24 s → **2 分 51 秒** | ⚠️ **会话现场口述，归档工件中无可复核记录** | `cap.txt` 仅含上表三次运行；[`research/31`](../research/31-v65-next-contract-fix.md) §1.1/§5 独立得出**同一判断**（"任务书里的「2 分 51 秒」不在本文件内，本轮无法复核"） |
+| **成功进入存档/世界** | ⚠️ **会话现场口述，本轮未取得判据行/存档加载记录** | 同上；本节**不把它写成已复核事实** |
+
+> ★ **一句话**：驱动侧的两道门（C2 / P2）已被**逐位可复核地**证明有效；
+> "分钟级 → 进世界"这一跳目前**只有现场口述**，归档还它一个"未复核"。
+
+### 29.4 活着之后仍然存在的那道门（v64 的挂起）
+
+v64 的三次运行都以**同一形态**收场（[`research/31`](../research/31-v65-next-contract-fix.md) §1.2）：
+
+```
+E/MESA: kbase: timeout on subqueue 0: seqno 636, target 637,
+  marks pre/post-call/post-wait 0x0/0x0/0x0, stream progress 0x0,
+  insert 122752, extract 122672, active 0, error 0x0, ...
+E/MESA: kbase: timeout snapshot subqueue 0/1/2: ... extract 122672/122672/122656, active 0, error 0x0
+F/MobileGL: Present, vkQueuePresentKHR → VK_ERROR_DEVICE_LOST (-4)
+```
+
+- **三个子队列的 ring `extract 都精确停在各自最后一条 ring entry 的 `CALL` 指令上**，
+  且 `CS_ACTIVE = 0`、`cell->error = 0`、**无 CS fault、无 TILER_OOM**、10 s 内 20 次 rekick 一字节未动；
+- 算术三条全部闭合（`122672 − 65536 = 57136 = 57024 + 112`，112 B = 14×8 = `CALL`；COMPUTE 队列为 `+96`）；
+- ⇒ **kbase wrapper 抢占 PanVK 流状态机**（每个 ring entry 头部重写 `SB_MASK_STREAM`）成为下一处嫌疑 ⇒
+  **v65**（`6.5-no-wrapper-sbmaskstream`，驱动 `b9952f75…`）删掉那 2 行，**尚未真机验证**。
+
+> ⚠️ 与前几轮的关键差别：**这次不是 OOM、不是 CS fault**（`error 0x0`、无 `0xc3`），
+> 而是**流切换（`CALL`）处的 CS 状态被卡** —— 病灶又往前走了一格。
+
+---
+
+## 30. ★★ C2 = 上游 open MR `!44173`：复用 tiler heap 前先等自家 tiling 工作退休
+
+### 30.1 改动（本树现状，逐字）
+
+文件 `src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c`，函数 `get_tiler_desc()`（本树起 `:1215`），
+在 `panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER)`（`:1224`）**之后**插入：
+
+```c
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+
+   {
+      /* The tiler heap is shared across render passes; wait for our own
+       * prior async tiling work to retire before reprogramming it.
+       * (upstream MR !44173 -- "wait for prior tiling work before reusing
+       * tiler heap", reported as tile-aligned corruption on Mali-G720) */
+      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      cs_wait_slots(b, dev->csf.sb.all_iters_mask);
+   }
+```
+
+**本树行号 `:1232`**（= `cs_wait_slots(b, dev->csf.sb.all_iters_mask);` 那一行；10 行 / 429 B 的块）。
+在 v62 树上同一块位于 `:1244-1252` —— **行号随树状态漂移，判据不要用行号**（见 §30.3）。
+
+### 30.2 效果
+
+- 存活时间从**秒级**跃升到**分钟级**、直至（现场口述）进入存档/世界 —— 见 §29.3 的证据状态分栏。
+- 与上游 open MR 的位置、表达式、mask 来源**逐字一致**（[`research/29`](../research/29-v62-c2-tiler-wait.md) §3 的逐条复核）。
+
+### 30.3 ★ 判据纪律：C2 的**独有判据**是归属注释，不是调用计数
+
+- **C2 的独有判据** = 归属注释 **`upstream MR !44173`**；
+- **`cs_wait_slots(b, dev->csf.sb.all_iters_mask)` 的出现次数不能单独作判据** ——
+  **v54 本身就有一处同形调用**（`mark_crc_valid_after_fragment()` 的 CRC 有效性路径，
+  v54 文件 `:1613` → v63 文件 `:1623`）⇒ 清洁基线的计数本来就是 **1**。
+  （这条判定由 [`research/30`](../research/30-v63-clean-c2.md) §1 给出，本轮复核一致。）
+
+### 30.4 确定性对照（撤回干净性证明）
+
+| 步骤 | 结果 |
+|---|---|
+| 撤掉 C1 + 撤掉 v58 的 2 行缓存失效后重编 | **逐位等于 `a9cba64afa935370…`（20 006 408 B，= v54 载荷）** ✓ |
+| 再**只**把 C2 块（字节级取自 v62 的同一块）贴回 | `c03f0e7b7e391b20…`（20 007 048 B），**二次重编逐位相同** ✓ |
+
+---
+
+## 31. ★★ P2 = 让 `kbase_renew_tiler_heap()` 真正触发（区间是决定性的）
+
+### 31.1 改动位置（★ 一个易错点）
+
+**不在** `src/panfrost/lib/kmod/kbase_kmod.c`，而在
+**`src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c`**（`kbase_renew_tiler_heap()` 定义起 `:2204`，调用点 `:2834`）。
+
+### 31.2 死代码根因
+
+原触发条件带 `submit->tiler_work_estimate &&` 前置门，而该字段**全树没有任何写入点**
+（只在 `panvk_cmd_buffer.h` 里声明）⇒ **计数永不推进 ⇒ 续期是死代码 ⇒ 堆只涨不落** ⇒
+涨到 `max_chunks` 后 `-ENOMEM` ⇒ 内核 `term_queue_group()` 杀组
+（即 §28.5/§28.6 抓到的那行 `kbase: CSF group N tiler heap OOM notification`）。
+
+### 31.3 修法（本树现状，逐字）
+
+```c
+   /* P2 / report 14 fix B: ... Count every graphics submission: the renewal
+    * interval then really means "every N graphics submissions". */
+   if (touched & graphics_mask) {
+      queue->kbase_tiler_submit_count++;
+      ...
+   }
+
+   uint64_t renew_work = kbase_tiler_heap_renew_work();
+   /* P2 / report 14 fix B: the submit->tiler_work_estimate guard made this
+    * block unreachable (dead field), so PANVK_KBASE_HEAP_RENEW_INTERVAL never
+    * fired.  Renew on the submit interval; ... */
+   if (queue->kbase_tiler_submit_count >= kbase_tiler_heap_renew_interval() ||
+       (submit->tiler_work_estimate && renew_work &&
+        queue->kbase_tiler_work_count >= renew_work)) {
+```
+
+- `graphics_mask = BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER) | BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT)`；
+  **clear-only 的 fragment 提交不计**（它不用 tiler heap，计进去只会白排空队列）；
+- 生效路径 = **每 N 次图形提交换一次 tiler heap**；工作阈值那条支路**保留**（等将来真有生产者）。
+
+### 31.4 开关与 ★ 决定性区间
+
+```c
+#define KBASE_TILER_HEAP_RENEW_INTERVAL 128          /* 默认 */
+/* PANVK_KBASE_HEAP_RENEW_INTERVAL=0 关闭续期；正数替换默认区间 */
+static uint32_t kbase_tiler_heap_renew_interval(void)   /* debug_get_num_option(...) */
+```
+
+| 区间 | 真机结果 |
+|---|---|
+| **128（默认）** | ★ **太晚** —— 实测堆在**第 ~107 次提交**就 `tiler heap OOM` |
+| **32（v64 现用）** | ★ **消灭 OOM、得以进世界** ✓ |
+| `100000`（等价关闭，反证） | ✗ `tiler heap OOM` **立刻复现** |
+
+### 31.5 正面证据（P2 真的在跑）
+
+v64 现场原文（诊断行，`interval` 打出来自证）：
+
+```
+I/MESA: kbase: tiler heap renewal (uAPI %u.%u, submits %u, renew interval %u)
+```
+
+- v64 两次运行分别打印 **23 次**（14:19:47.548 … 14:20:04.109）与 **19 次**（14:23:31.662 … 14:23:46.472）；
+- **归档 `cap.txt` 13:05–14:47 全窗口 `tiler heap OOM` = 0 次** ⇒ OOM 被消灭 ✓。
+
+> ⚠️ **口径**：P2 是**绕过**而不是"修好" TILER_OOM CSI ——
+> v53（P1）补的 uAPI 1.18 档 + `csi_handlers` 仍**未被证明送达内核**（§27.3），
+> 内核侧是否接受 40 B ioctl 仍未定案；见 §34 遗留项。
+
+---
+
+## 32. ⛔ 三个已确认有害/无效的自造改动（**必须撤回**）
+
+| 代号 | 改动（原文口径） | 判定 | 证据 |
+|---|---|---|---|
+| **C1** | kbase 路径上不再发 `cs_vt_end` / `cs_finish_fragment` / `cs_frag_end`，且不再注册/撤销 **TILER_OOM** 异常处理器（用 `cmdbuf_skips_gpu_heap_ops(cmdbuf)` 守卫，6 处） | ✗ **有害** | 流水线在**第 3~4 个作业即卡死**（[`research/26`](../research/26-c1-heap-suppression.md)、[`research/27`](../research/27-v60-clean-c1.md)） |
+| **v58 的 2 行** | `kbase_subqueue_publish()` 里读 `*active` 之前加 `kbase_cache_invalidate_range()`（`:733` / `:737`） | ✗ **无效** | 真机结果无改善（[`research/25`](../research/25-cacheinvalidate-kick-fix.md)） |
+| **P5** | 把 AHB modifier 回退从 `DRM_FORMAT_MOD_LINEAR` 改成 **AFBC `0x0800000000000072`**（= `DRM_FORMAT_MOD_ARM_AFBC(32x8 \| SPARSE \| SPLIT \| YTR)`，开关 `PANVK_GRALLOC_AFBC_FALLBACK`） | ✗ **有害** | 触发 **`exception 0xc3`**（GPU MMU `TRANSLATION_FAULT_3`）（[`research/21`](../research/21-p5-modifier-fallback.md)、[`research/13`](../research/13-csf-exception-c3.md)） |
+
+### 32.1 撤回的纪律（本轮的做法，值得保留）
+
+- **不用** `git checkout / restore / reset`（kbase 后端文件**未跟踪**，`git checkout --` 会丢东西）；
+- 改前一律 `cp <f> <f>.bak-$(date +%s)`；撤回 = **`cp` 回备份 + 重编**；
+- **撤回是否干净的证明** = "撤掉本改动后重编 ⇒ **逐位等于**上一版 `.so`"（§33.4）。
+
+### 32.2 撤回后的干净基线锚点（供后人核对）
+
+| 备份文件 | = 什么 | 判据 |
+|---|---|---|
+| `cmd_draw.c.bak-1791177353`（188 403 B，md5 `ed4341fb…`） | **v54 的 `cmd_draw.c`（清洁基线）** | `kbase_node_path/cmdbuf_skips_gpu_heap_ops` 计数 **0/0**、`!44173` **0**、`cs_wait_slots(all_iters)` = 1（既有 CRC 路径） |
+| `cmd_draw.c.bak-1791177577` / `.bak-1791178999`（189 819 B，md5 `7922af87…`） | v54 + C1（**无** C2） | C1 计数 7、`!44173` = 0 |
+| `gpu_queue.c.bak-1791176223`（122 818 B，md5 `b879e20c…`） | **v54（含 P2）** | P2 判据齐 |
+
+---
+
+## 33. ★ 工程教训：四条可复用检查项（本轮踩坑换来的）
+
+### 33.1 静默回落陷阱（最贵的一条）
+
+转发垫片找 ICD 的候选顺序（[`source/shim/vkshim_mgl.c`](../source/shim/vkshim_mgl.c) 第 45 行原文）：
+
+```c
+  const char* c[]={cand0,"libvulkan_freedreno.so","/data/local/tmp/libvulkan_freedreno.so",0};
+```
+
+**顺序里含 `/data/local/tmp`，而且垫片不打印最终选中的那一条路径。**
+后果：**探针时代遗留在 `/data/local/tmp/libvulkan_freedreno.so` 的一份旧驱动**被优先命中 ⇒
+**v50–v54 的改动全部没有被加载** —— 这就是"**加了日志却没有输出**"的真因
+（很长一段时间被误判成"日志通道有问题"，实际是**跑的根本不是新驱动**）。
+
+★ **铁律（每次上机前必做）**：
+
+1. **显式**把本次驱动放到 `/data/local/tmp/libvulkan_freedreno.so`；
+2. `sha256sum` 校验它 **== 本次构建产物**（**不校验不上机**）；
+3. 装机后**先从日志确认驱动指纹**（`driverVersion` / 续期行 / 归属注释），再谈任何结论。
+
+> 补强：C2 的"归属注释"式判据（§30.3）与 P2 的续期行（§31.5）都是为此设的**自证指纹** ——
+> 让"改动到底有没有被加载"变成**日志里能一眼看到**的事实。
+
+### 33.2 空载荷 APK 陷阱
+
+`unzip` 模式不匹配 ⇒ 打出**没有 `lib/`** 的 APK，而 **`apksigner verify` 照样通过**（v51 实例，§26.1）。
+
+★ **每次打包后必做**：
+
+```bash
+unzip -p <apk> lib/arm64-v8a/libvulkan_freedreno.so | sha256sum
+# 必须：非空（长度 > 0）且 == 构建产物 sha256
+```
+
+### 33.3 日志落盘位置
+
+| 位置 | App 通道可读？ | 结论 |
+|---|---|---|
+| `/data/local/tmp/cap.txt` | ✗ **Shizuku 掉线后就读不到** | 弃用 |
+| **`/sdcard/MG/cap.txt`** | ✓ | **现用** |
+
+> ⚠️ **本轮追加的教训**：`/sdcard/MG/cap.txt` **会被轮转/截断**
+> （取证过程中从 81 MB 被截到 6.9 MB，14:19–14:24 那三次运行的全部记录随之消失）。
+> ⇒ **取到的关键证据必须当场摘录进记录**（§29/§31 的那些原文行就是这么留下的）。
+
+### 33.4 确定性对照纪律（本轮最有价值的方法论）
+
+**每次改动都要有对照**：**撤掉本改动后重编 ⇒ 逐位等于上一版 `.so`**，用来证明"这是单变量"。
+本轮已多次执行 ✓：
+
+| 对照 | 结果 |
+|---|---|
+| 撤 C1 + 撤 v58 两行 ⇒ 重编 | 逐位 = `a9cba64a…`（**= v54**） ✓ |
+| 贴回 C2（只此一处）⇒ 重编 | `c03f0e7b…`（v63），二次重编逐位相同 ✓ |
+| v65 撤掉 wrapper 的 `SB_MASK_STREAM` 两行 ⇒ 重编 | 逐位 = `c03f0e7b…`（**= v64**） ✓ |
+
+---
+
+## 34. 版本与哈希账本（v54 / v63 / v64 + 七个被撤回的中间版）
+
+> 完整台账（含大小、mtime、用途、原始 `sha256sum` 输出）见 [`MANIFEST.md`](../MANIFEST.md) §B.1 / §E.2。
+> 下表为**本节的速查**：驱动 = APK 内 `lib/arm64-v8a/libvulkan_freedreno.so`。
+
+### 34.1 在用的三个版本
+
+| 版本 | versionName | 驱动 sha256 | 驱动大小 | APK sha256 | APK 大小 |
+|---|---|---|---|---|---|
+| **v54** | `5.4-p2-tiler-heap-renew` | `a9cba64afa935370…` | 20 006 408 | `860d0780817ba4e2…` | 10 187 311 |
+| **v63** | `6.3-v54-plus-c2` | `c03f0e7b7e391b20…` | 20 007 048 | `e0c249da36b111b6…` | 10 187 311 |
+| **v64** | `6.4-fast-renew32` | **同 v63**（`c03f0e7b…`） | 20 007 048 | `db9a816317008d4b…` | 10 187 311 |
+
+> ★ **v64 与 v63 的唯一差异是 `pojavEnv` 多一项 `PANVK_KBASE_HEAP_RENEW_INTERVAL=32`**（驱动逐位相同）——
+> 这是本项目**最便宜的一次决定性改动**（无需重编驱动）。
+
+### 34.2 被撤回的中间版（**勿用**）
+
+| 版本 | versionName | 驱动 sha256 | APK sha256 | 撤回原因 |
+|---|---|---|---|---|
+| v56 | `5.6-p5-mtk-afbc-modifier` | `d0476a0c155af5de…` | `1ecfb2ffc6cf33d8…` | P5（AFBC）⇒ `exception 0xc3` (§32) |
+| v57 | `5.7-fix1-always-kick` | `3a76cce8c1c4abf2…` | `d0362a49dc9a17c6…` | 删快路径 ⇒ 无效 |
+| v58 | `5.8-fix1-csinvalidate` | `ac198f581a76669e…` | `9df71f79a4bb2111…` | 2 行缓存失效 ⇒ 无效 (§32) |
+| v59 | `5.9-c1-kbase-heap-suppress` | `b918a45fc96be2be…` | `e42abdfb129bb9a6…` | C1 ⇒ 有害 (§32) |
+| v60 | `6.0-clean-c1-kbase-heap-suppress` | `1335b5c07ed28afd…` | `d1848cb66f56dd7f…` | C1 干净版 ⇒ 仍有害 (§32) |
+| v61 | `6.1-c1-plus-cache-invalidate` | `1915d16e8a3096c5…` | `4c1443ed03fa23f9…` | C1 + 2 行 ⇒ 仍有害 |
+| v62 | `6.2-c2-tiler-heap-wait` | `61d35b1cd82c72f5…` | `36fe040f1433924c…` | 含 C1（不干净）⇒ 被 v63 取代 |
+| v62env | （env-only） | `a9cba64a…`（= v54） | `3f1b694ddcbe21d4…` | 关续期反证用 |
+
+### 34.3 遗留与未决（如实）
+
+| # | 事项 | 状态 |
+|---|---|---|
+| R1 | **v64 仍会挂起**：三子队列 `extract` 停在 `CALL`、`active 0`、`error 0x0`、无 fault 无 OOM | **未解决**；v65（`6.5-no-wrapper-sbmaskstream`，驱动 `b9952f75…`）已出包但**未上机** |
+| R2 | **「2 分 51 秒」最长存活** 与 **「进入存档/世界」** | ⚠️ **会话口述，归档工件中未复核**（§29.3） |
+| R3 | **P1（v53）的 uAPI 1.18 档 + `csi_handlers` 是否送达内核** | 仍未定案（§27.3）；P2 是**绕过**了 OOM，不是修好了 CSI |
+| R4 | 「原始 logcat 全文」 | **无**：`cap.txt` 已轮转截断（§33.3）；本节引用均为**当场摘录的关键行** |
+| R5 | `driverVersion` 两处记录不一致（探针 `26.2.24.3` vs 真机 `26.2.99`） | 未决（承 §8 与 U5） |

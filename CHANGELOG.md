@@ -33,7 +33,14 @@
   → v51 空载荷 APK(unzip 匹配失败) ⇒ 废弃，勿用
   → v52 = v50 载荷 + 全套调试 env ⇒ 落盘 logcat 抓到 kbase CSF group 0 tiler heap OOM
   → v53(P1) 补 uAPI 1.18 档 + csi_handlers ⇒ ★ 真机无效 ✗(无 TILER_OOM CSI handler 行)
-  → 下一步：P2(接上 tiler heap renew，治「只涨不落」)
+  → v54(P2)：去掉 submit->tiler_work_estimate 前置门 ⇒ kbase_renew_tiler_heap() 真正触发
+  → v56(P5 AFBC)⇒ exception 0xc3 ✗ · v57/v58(缓存失效)⇒ 无效 ✗ · v59–v61(C1 抑制 heap ops)⇒ 第 3~4 个作业即卡死 ✗
+  → v62：C2(上游 open MR !44173)首次编入；v63 = v54 逐位基线 + C2(干净单变量，确定性对照通过)
+  → ★★ 存活从「秒级」跃升到「分钟级」(C2)
+  → v64 = v63 + PANVK_KBASE_HEAP_RENEW_INTERVAL=32(默认 128 太晚：堆在第 ~107 次提交就 OOM)
+  → ★★★ P2 消灭 tiler heap OOM ⇒ 得以进入存档/世界(现场口述；见 §29.3 证据状态分栏)
+  → v64 仍然挂起：三子队列 ring extract 精确停在 CALL、active 0、error 0x0、无 fault 无 OOM
+  → v65(删掉 wrapper 重写 SB_MASK_STREAM 的 2 行)已出包，★ 未上机
 ```
 
 ---
@@ -554,6 +561,82 @@ v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**
 ---
 
 
+## M14 · ★★★ 里程碑：分钟级存活 —— 两个决定性修复（C2 / P2）与三个被撤回的自造改动
+
+> 证据：[`docs/09 §29–§34`](docs/09-mobilegl-integration.md)、[`research/21`](research/21-p5-modifier-fallback.md)–[`research/31`](research/31-v65-next-contract-fix.md)、[`MANIFEST.md`](MANIFEST.md) §B.1。
+> **口径**：驱动侧两道门（C2/P2）是**逐位可复核**的；"分钟级 → 进世界"这一跳目前**只有现场口述**，
+> 本节按 [`README.md` §6.6](README.md) 如实标注为"**未复核**"，不写成事实。
+
+### M14.1 C2 = 上游 open MR `!44173`：复用 tiler heap 前先等自家 tiling 工作退休
+
+- **位置**：`src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c` 的 `get_tiler_desc()` 内、
+  `panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER)` **之后**，
+  插入 `cs_wait_slots(b, dev->csf.sb.all_iters_mask);`（本树 `:1232`；v62 树在 `:1244-1252`）。
+- **效果**：存活时间从**秒级**跃升到**分钟级**、直至（现场口述）进入存档/世界 ✓
+- **落地版本**：v62 首次编入（`6.2-c2-tiler-heap-wait`，驱动 `61d35b1c…`）；
+  **v63 = v54 逐位基线 + C2**（干净单变量，驱动 `c03f0e7b…`）。
+- ★ **判据纪律**：C2 的**独有判据**是归属注释 **`upstream MR !44173`**；
+  **`cs_wait_slots(all_iters_mask)` 的出现次数不能单独作判据** —— v54 本身就有一处同形调用
+  （`mark_crc_valid_after_fragment()` 的 CRC 路径，v54 `:1613` → v63 `:1623`），清洁基线计数本就是 1。
+- **确定性对照**：撤 C1 + 撤 v58 两行后重编 ⇒ **逐位 = `a9cba64a…`（= v54）** ✓；贴回 C2 ⇒ `c03f0e7b…`，二次重编逐位相同 ✓
+
+### M14.2 P2：让 `kbase_renew_tiler_heap()` 真正触发（★ 区间是决定性的）
+
+- **位置**：**`src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c`**（**不是** `kbase_kmod.c`）；
+  函数起 `:2204`、调用点 `:2834`。
+- **死代码根因**：触发条件带 `submit->tiler_work_estimate &&`，而该字段**全树无写入点**（只在 `panvk_cmd_buffer.h` 声明）
+  ⇒ 计数永不推进 ⇒ **续期是死代码** ⇒ 堆只涨不落 ⇒ `-ENOMEM` ⇒ 内核 `term_queue_group()` 杀组。
+- **修法**：`kbase_tiler_submit_count` 改为**每 N 次图形提交**（`touched & graphics_mask`，clear-only 不计）就触发续期；
+  工作阈值那条支路保留（等将来真有生产者）。
+- **开关**：`PANVK_KBASE_HEAP_RENEW_INTERVAL`（默认 `KBASE_TILER_HEAP_RENEW_INTERVAL 128`；`0` = 关闭）。
+- ★ **区间对照（决定性）**：**128 太晚**（实测堆在**第 ~107 次提交**就 `tiler heap OOM`）→
+  **32**（v64 现用）**消灭 OOM** ✓ → `100000`（等价关闭，反证）**OOM 立刻复现** ✓。
+- **正面证据**：v64 现场打印 `kbase: tiler heap renewal (uAPI %u.%u, submits %u, renew interval %u)`
+  共 **23 次 / 19 次**（两次运行），`interval 32` 生效 ✓；
+  归档 `cap.txt` **13:05–14:47 全窗口 `tiler heap OOM` = 0 次**（v52/v53 时代同一条通知是常客）✓
+
+### M14.3 v63 = v54 + C2（干净单变量）
+
+- versionName `6.3-v54-plus-c2`；驱动 `c03f0e7b7e391b20…`（20 007 048 B）；APK `e0c249da36b111b6…`（10 187 311 B）。
+- **撤回干净性**：撤掉 C1 + 撤掉 v58 的 2 行后重编 ⇒ **逐位等于 v54 载荷 `a9cba64a…`（20 006 408 B）** ✓
+
+### M14.4 v64 = v63 + `PANVK_KBASE_HEAP_RENEW_INTERVAL=32`
+
+- versionName `6.4-fast-renew32`；**驱动逐位同 v63**（`c03f0e7b…`）；APK `db9a816317008d4b…`（10 187 311 B）。
+- ★ **v64 与 v63 的唯一差异是 `pojavEnv` 多一项 env** —— 本项目**最便宜的一次决定性改动**（无需重编驱动）。
+- **结果**：★ **消灭 tiler heap OOM**，得以进入存档/世界（现场口述）。
+
+### M14.5 ⛔ 三个已确认有害/无效的自造改动（**必须撤回**）
+
+| 代号 | 改动 | 判定 | 证据 |
+|---|---|---|---|
+| **C1** | kbase 路径上抑制 `cs_vt_end` / `cs_finish_fragment` / `cs_frag_end` 与 **TILER_OOM** 处理器注册（`cmdbuf_skips_gpu_heap_ops()` 守卫，6 处） | ✗ **有害** | 流水线在**第 3~4 个作业即卡死** |
+| **v58 的 2 行** | `kbase_subqueue_publish()` 读 `*active` 前加 `kbase_cache_invalidate_range()`（`:733`/`:737`） | ✗ **无效** | 真机无改善 |
+| **P5** | AHB modifier 回退从 `LINEAR` 改成 AFBC **`0x0800000000000072`**（`PANVK_GRALLOC_AFBC_FALLBACK`） | ✗ **有害** | 触发 **`exception 0xc3`**（MMU `TRANSLATION_FAULT_3`） |
+
+- **撤回纪律**：**不用** `git checkout/restore/reset`（kbase 后端文件未跟踪）；改前 `cp <f> <f>.bak-$(date +%s)`；
+  撤回 = `cp` 回备份 + 重编，并用"**撤掉后逐位等于上一版 `.so`**"证明干净。
+
+### M14.6 四条工程教训（已写入 [`docs/09 §33`](docs/09-mobilegl-integration.md)）
+
+1. **静默回落陷阱**：垫片找 ICD 的候选顺序含 `/data/local/tmp`（[`source/shim/vkshim_mgl.c:45`](source/shim/vkshim_mgl.c)）**且不打印选中路径**
+   ⇒ 探针时代遗留的**一份旧驱动**让 **v50–v54 的改动全部未被加载**（"加了日志却没输出"的真因）。
+   ★ **铁律：每次上机前必须把驱动显式放到 `/data/local/tmp/libvulkan_freedreno.so` 并校验 sha256。**
+2. **空载荷 APK 陷阱**：`unzip` 模式不匹配 ⇒ 打出没有 `lib/` 的 APK，而 `apksigner verify` 照样通过（v51）。
+   ★ 必做 `unzip -p <apk> lib/arm64-v8a/libvulkan_freedreno.so | sha256sum`：非空且等于构建产物。
+3. **日志落盘位置**：`/data/local/tmp/cap.txt` 在 Shizuku 掉线后 App 通道读不到 ✗ ⇒ 改写到 **`/sdcard/MG/cap.txt`** ✓。
+   ⚠️ 追加：该文件**会被轮转截断**（取证中由 81 MB 截到 6.9 MB）⇒ **关键证据必须当场摘录**。
+4. **确定性对照纪律**：每次改动都要有"**撤掉本改动后重编 ⇒ 逐位等于上一版 `.so`**"的对照（本轮已多次执行 ✓）。
+
+### M14.7 v64 的下一道门：`ring extract` 卡在 `CALL`（v65 待验）
+
+- v64 三次运行**同形收场**：三个子队列的 ring `extract` **精确停在各自最后一条 ring entry 的 `CALL` 指令上**，
+  `CS_ACTIVE = 0`、`cell->error = 0`、**无 CS fault、无 TILER_OOM**、10 s 内 20 次 rekick 一字节未动；
+- ⇒ 病灶从"OOM"前移到"**流切换（`CALL`）处的 CS 状态被卡**"；嫌疑 = kbase wrapper 在 ring entry 头部重写 `SB_MASK_STREAM`；
+- **v65**（`6.5-no-wrapper-sbmaskstream`，驱动 `b9952f75…`）删掉那 2 行，**已出包、未上机**（见 U15）。
+
+---
+
 ## 附：本仓库**如实记录**的未解项（不隐藏）
 
 | # | 未解项 | 依据 |
@@ -568,7 +651,8 @@ v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**
 | U11 | **`O_RDONLY` 下 `DMA_HEAP_IOCTL_ALLOC` 是否成功 / `kbase_kmod_supports_dmabuf()` 的实际返回值**：本轮只做了源码推断（"必然失败"），未在设备侧取证；`research/06` 的注释给出的是**相反**推断 | `docs/09 §23.3` |
 | U12 | **v50（真 Android 交换链补丁）** ⇒ ✅ **已上机**（`docs/09` §28.4：真交换链 + 主界面干净渲染约 10 秒）；⚠️ `-4` 仍在（该补丁不解决它） | `docs/09 §24.5`、`research/11` §7 |
 | U13 | **可复现的 `-1000072003` 只在 AHB `IMPLEMENTATION_DEFINED(0x22)` 上出现**（`Failed to get u_gralloc_buffer_basic_info`）；真实 App 的 Surface 用的正是该格式 ⇒ 与 U1 是**两条独立线** | `docs/09 §25.5`、`research/12` §6 |
-| U14 | ★ **tiler heap OOM 线（真实 App 现场的唯一直接拦路者）**：`E/MESA: kbase: CSF group 0 tiler heap OOM notification` → +9 s `-4`；**P1（v53）已上机验证无效 ✗**（仍 OOM、无 `TILER_OOM CSI handler (1.18 layout, ioctl 58)` 行）⇒ 根因按 `research/14` = **堆只涨不落**（`tiler_work_estimate` 全树无生产者 ⇒ `kbase_renew_tiler_heap()` 是死代码）；**下一步 P2** | `docs/09 §27/§28.5/§28.6`、`research/14`、`research/16` |
+| U15 | ★ **v64 仍会挂起（当前第一拦路者）**：三个子队列的 ring `extract` **精确停在各自最后一条 ring entry 的 `CALL`**，`CS_ACTIVE=0`、`error 0x0`、**无 CS fault、无 TILER_OOM**、10 s 内 20 次 rekick 一字节未动 ⇒ 病灶 = **流切换（`CALL`）处的 CS 状态被卡**；嫌疑 = kbase wrapper 在每个 ring entry 头部重写 `SB_MASK_STREAM`。**v65 已出包（驱动 `b9952f75…`）但未上机** | `docs/09 §29.4/§34.3`、[`research/31`](research/31-v65-next-contract-fix.md) |
+| U16 | ⚠️ **「2 分 51 秒」最长存活** 与 **「成功进入存档/世界」**：**会话现场口述，归档工件中未复核** —— 归档 `cap.txt` 仅含三次运行（进程存活 55.2 / 82.2 / 50.2 s，渲染期最长 68 s 无 `-4`），且该文件已被轮转截断；[`research/31`](research/31-v65-next-contract-fix.md) §1.1/§5 独立得出同一判断 | `docs/09 §29.3`、[`research/31`](research/31-v65-next-contract-fix.md) |
 
 **✅ 本轮已闭合（从上方未解项中移出）**
 
@@ -578,6 +662,11 @@ v50 落成"真 Android 交换链"补丁（**未上机**）；而**独立探针**
 | ~~U8~~ | `research/10` 探针未上机；`research/05` 方案 A 未上机 | ✅ **探针已上机**（8 模式，见 `docs/09 §25`、`research/12`）；**方案 A 已实施并编入 v50**（见 `docs/09 §24`、`research/11`）——但 v50 本身仍未上机（保留为 **U12**） |
 | ~~U10~~ | v48/v49/v50 的运行结果无记录（`docs/09` 止于 §22/v47） | ✅ **已闭合**：`docs/09` 新增 **§23（v48/v49）**、**§24（v50）**、**§25（探针 8 模式）**，本文件新增 **M12** |
 | ~~U12~~ | v50（真交换链补丁）从未在真机运行 | ✅ **已上机**：`Swapchain created, extent = 2376x1080, swapchain imageCount = 3` + 主界面（含 3D 全景）干净渲染约 10 秒（`docs/09 §28.4`）；⚠️ `-4` 仍在 |
+| ~~U14~~ | tiler heap OOM 线（真实 App 现场的直接拦路者） | ✅ **OOM 线已闭合**：**P2（§31）真的触发续期** —— v64 现场打印 `kbase: tiler heap renewal (… renew interval 32)` **23 次 / 19 次**，且归档 `cap.txt` **13:05–14:47 全窗口 `tiler heap OOM` = 0 次**（v52/v53 时代同一条通知是常客）。⚠️ **但这是"绕过"不是"修好"**：P1（v53）的 uAPI 1.18 档 + `csi_handlers` 是否送达内核**仍未定案**（保留为 **R3**）；且第一拦路者已换成 **U15**（`CALL` 处卡住） | `docs/09 §31/§34.3`、[`research/14`](research/14-tiler-heap-oom.md)、[`research/31`](research/31-v65-next-contract-fix.md) |
 
-> **未闭合项的口径**：v50 的实机运行（U12）与 dma_heap 的 `O_RDONLY`/ALLOC 判定（U11）
-> 是**本轮唯一新增的两个未知**；其余未解项与上一版一致，未被本轮证据触及。
+> **未闭合项的口径**：本轮（M14）的净变化是 —— **tiler heap OOM 线闭合（~~U14~~，靠 P2 续期）**，
+> 但**第一拦路者前移到 `CALL` 处的 CS 状态卡住（U15）**，且"分钟级 → 进世界"这一跳
+> **只有现场口述、归档未复核（U16）**。U11（dma_heap 的 `O_RDONLY`/ALLOC 判定）与
+> U5/U6/U7/U9 等其余未解项**未被本轮证据触及**，口径与上一版一致。
+> 归档侧新增一条**方法论**未决：`/sdcard/MG/cap.txt` 会被轮转截断（`docs/09 §33.3`），
+> 长跑取证的落盘策略需要重新设计。

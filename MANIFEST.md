@@ -84,6 +84,60 @@
 
 ---
 
+## B.1 本轮主线：`v54` → `v65`（2026-10-05 14:00–14:45）★ 里程碑与撤回台账
+
+> **为什么单列**：v54 起是本项目**第一次把"一画就崩"推进到"分钟级存活"**的一串版本
+> （[`docs/09 §29–§34`](docs/09-mobilegl-integration.md)、[`CHANGELOG.md` M14](CHANGELOG.md)）。
+> 本节把**在用的**与**已撤回的**分开列，避免后来者误用被证伪的版本。
+>
+> **哈希口径**与 §A 一致（`sha256(前16)` = 前 16 个十六进制字符）。
+> **双点核对**：下列 `mgl-panvk-vNN.apk` 的哈希在**手机 `驱动/` 副本**与**服务器 `/root/final/`**
+> 两处**独立实测一致** ✓（这条"两处一致"本身就是防"拿错文件"的校验，参见 `docs/09 §33.1` 的静默回落陷阱）。
+> `驱动 sha256` = APK 内 `lib/arm64-v8a/libvulkan_freedreno.so` 的哈希。
+
+### B.1.1 ★ 在用版本（三个）
+
+| 版本 | versionName | 驱动 sha256(前16) | 驱动大小 (B) | APK sha256(前16) | APK 大小 (B) | 用途 / 结果 |
+|---|---|---|---|---|---|---|
+| **v54** | `5.4-p2-tiler-heap-renew` | `a9cba64afa935370` | 20 006 408 | `860d0780817ba4e2` | 10 187 311 | **P2**：去掉 `submit->tiler_work_estimate &&` 前置门 ⇒ `kbase_renew_tiler_heap()` 真正触发。**是 v63/v64 的清洁基线**：撤掉 C1 + v58 两行后重编 ⇒ **逐位等于本行驱动** ✓ |
+| **v63** | `6.3-v54-plus-c2` | `c03f0e7b7e391b20` | 20 007 048 | `e0c249da36b111b6` | 10 187 311 | **v54 逐位基线 + C2**（上游 open MR `!44173`）＝**干净单变量版**；存活从"秒级"跃升到**"分钟级"** ✓。**二次重编逐位相同** ✓ |
+| **v64** | `6.4-fast-renew32` | **同 v63**（`c03f0e7b…`） | 20 007 048 | `db9a816317008d4b` | 10 187 311 | **v63 + env `PANVK_KBASE_HEAP_RENEW_INTERVAL=32`**（驱动逐位不变）⇒ ★ **消灭 tiler heap OOM**、得以进入存档/世界（现场口述，见 `docs/09 §29.3` 证据状态分栏） |
+
+> ★ **v64 与 v63 的唯一差异是 `pojavEnv` 多一项 env**，**驱动逐位相同** ——
+> 本项目**最便宜的一次决定性改动**（无需重编驱动，10 秒级打包）。
+> **区间为什么必须是 32**：默认 **128 太晚**（实测堆在**第 ~107 次提交**就 `tiler heap OOM`）；
+> `100000`（等价关闭，反证）⇒ OOM **立刻复现** ✓（`docs/09 §31.4`）。
+> **正面证据**：v64 现场打印 `kbase: tiler heap renewal (… renew interval 32)` **23 次 / 19 次**，
+> 且归档 `cap.txt` **13:05–14:47 全窗口 `tiler heap OOM` = 0 次** ✓
+
+### B.1.2 ⛔ 已撤回的中间版（**勿用**）
+
+| 版本 | versionName | 驱动 sha256(前16) | APK sha256(前16) | 撤回原因 |
+|---|---|---|---|---|
+| v56 | `5.6-p5-mtk-afbc-modifier` | `d0476a0c155af5de` | `1ecfb2ffc6cf33d8` | **P5 有害**：AHB modifier 回退改 AFBC `0x0800000000000072` ⇒ 触发 `exception 0xc3`（MMU `TRANSLATION_FAULT_3`） |
+| v57 | `5.7-fix1-always-kick` | `3a76cce8c1c4abf2` | `d0362a49dc9a17c6` | 删快路径 ⇒ **无效** |
+| v58 | `5.8-fix1-csinvalidate` | `ac198f581a76669e` | `9df71f79a4bb2111` | `kbase_subqueue_publish()` 读 `*active` 前加 2 行缓存失效 ⇒ **无效** |
+| v59 | `5.9-c1-kbase-heap-suppress` | `b918a45fc96be2be` | `e42abdfb129bb9a6` | **C1 有害**：抑制 `cs_vt_end` / `cs_finish_fragment` / `cs_frag_end` 与 TILER_OOM 注册 ⇒ 流水线第 3~4 个作业即卡死 |
+| v60 | `6.0-clean-c1-kbase-heap-suppress` | `1335b5c07ed28afd` | `d1848cb66f56dd7f` | C1 的"干净"版 ⇒ **仍有害** |
+| v61 | `6.1-c1-plus-cache-invalidate` | `1915d16e8a3096c5` | `4c1443ed03fa23f9` | C1 + 2 行缓存失效 ⇒ **仍有害** |
+| v62 | `6.2-c2-tiler-heap-wait` | `61d35b1cd82c72f5` | `36fe040f1433924c` | C2 首次编入，但**含 C1（不干净）** ⇒ 被 v63（干净单变量）取代 |
+| v62env | —（env-only，无新 versionName 记录） | `a9cba64afa935370`（**= v54**） | `3f1b694ddcbe21d4` | **关续期的反证包** ⇒ `tiler heap OOM` 立刻复现 ✓ |
+
+### B.1.3 在途版本（**未验证，勿当结论**）
+
+| 版本 | versionName | 驱动 sha256(前16) | APK sha256(前16) | 状态 |
+|---|---|---|---|---|
+| v65 | `6.5-no-wrapper-sbmaskstream` | `b9952f750c6e452c` | `d59b50705b816463`（服务器 `/root/final/`） | **已出包、未上机**：删掉 kbase wrapper 在每个 ring entry 头部重写 `SB_MASK_STREAM` 的 2 行。⚠️ 手机 `驱动/mgl-panvk-v65.apk` 在取证期间**大小两次变化**（in-flight 重打包）⇒ **手机侧副本不作准，以 `/root/final/` 为准**（`docs/09 §29.4`、[`research/31`](research/31-v65-next-contract-fix.md)） |
+
+### B.1.4 跨版本常量载荷（便于逐位比对）
+
+| 载荷 | sha256（全文 64 位） | 说明 |
+|---|---|---|
+| `lib/arm64-v8a/libMobileGL.so` | `72919c73a7e07630f329bb4ad9605c606a9aac9e2fc6596683ee7b9f9c76848b` | v53–v65 全部沿用同一份（**唯一变量隔离在驱动与 env 上**） |
+| `classes.dex` | `6bd3abde2c53506f1b54bb88a8069c3cc394c2fb08440e4ca475cbf8fd64f4ad` | 同上 |
+
+---
+
 ## C `/root/final/` 内的其它 APK（同一目录，非主线）
 
 | 文件 | 大小 (B) | sha256(前16) | 说明 |
@@ -205,6 +259,50 @@ d67a326c85c3620da9cc06d694e08d92639ab9cdc067476addf70a478e7f31da  panvk-shim.apk
 58ef996f9cfd5dbd88c37daea4f02bbde4fdee5818561526d21cf9adadefbec4  libvulkan_panfrost.so   (v53 驱动件，另存 /root/dist-v53/)
 ```
 
+
+### E.2 追加：`v54`–`v65` 的实测输出（2026-10-05，双点核对）
+
+> 同 §E.1 的规矩：**原始输出保持原样**，由同一台服务器 `cd /root/final && sha256sum` 实测。
+> **手机侧副本核对**：v54/v57/v58/v60/v61/v62env/v63/v64 的 `sha256(前16)`
+> 与手机 `驱动/mgl-panvk-vNN.apk` **逐字符一致** ✓（两处独立实测，防止"拿错文件"）。
+
+```
+860d0780817ba4e2ffb95fb975f9b2ed02ad8b87687844ad4d7ac64a7f2644b6  mgl-panvk-v54.apk
+1ecfb2ffc6cf33d8b28376d079da38a3a38e3b01d647acafd87b55594fcefbec  mgl-panvk-v56.apk
+d0362a49dc9a17c6c00ea2d8cdca347d7f1e29b09358aa47424aab430a1b26ee  mgl-panvk-v57.apk
+9df71f79a4bb21111d903a6f03534d1b318af86e238a31182c119a7a976abe05  mgl-panvk-v58.apk
+e42abdfb129bb9a6d707502ab671e9132eb861cb15fe7164efb1f5431a88aefe  mgl-panvk-v59.apk
+d1848cb66f56dd7f48d2dda7c36ad9458ccffc6816366752f5bf7ca409869f6d  mgl-panvk-v60.apk
+4c1443ed03fa23f9e6ed61db48cdf9d6ff9d10839e92b8c579f6980d4560291a  mgl-panvk-v61.apk
+36fe040f1433924c48c83f0c061de9833937eade9a3e89032b92f85f5152f884  mgl-panvk-v62.apk
+3f1b694ddcbe21d4682b8314b45764456d77c2989f6fc5298beecbe4ffe52603  mgl-panvk-v62env.apk
+e0c249da36b111b61dfa28df28ad09ff89dd6ecfd1c915c475f38f9349ba3feb  mgl-panvk-v63.apk
+db9a816317008d4ba296a9fa80babee12efb659825e0046d018e732123ec1a09  mgl-panvk-v64.apk
+d59b50705b81646362f36b28934f1955ac324e8d3af383e8f3bfc08b8699b854  mgl-panvk-v65.apk
+```
+
+驱动件（APK 内 `lib/arm64-v8a/libvulkan_freedreno.so`，取自各版本构建目录 `/root/vNN/`）：
+
+```
+a9cba64afa935370906e1a8533550816c6a018f4d6808cb8951dd4e1099333f1  v54 驱动  (20 006 408 B)
+c03f0e7b7e391b20edfcadcfc4b69068693dacdb785fb6ad0c6bf6e6fcdb1106  v63 驱动  (20 007 048 B)  ← 与 v64 逐位相同
+d0476a0c155af5debbd9cf3a7eee4b8aaab1b6a70bb1947901c2a959c6a9dd1a  v56 驱动  (20 010 648 B)
+61d35b1cd82c72f5c507811665db2ffd43fd0e2259939f3a0f62343f504dfa83  v62 驱动  (20 009 576 B)
+b9952f750c6e452c71bb1b7b368f7c4909aff9f91717628cb89031c7b9d1eeb0  v65 驱动  (20 006 016 B，在途未验证)
+```
+
+**APK 大小**：v54/v57/v62env/v63/v64/v65 = **10 187 311 B**；v56/v58/v59/v60/v61/v62 = **10 191 407 B**
+（差 4 096 B 与 `pojavEnv` / `boatEnv` 字符串长度的差异一致）。
+
+> ⚠️ **两项口径更正**（本轮实测发现，供后人避坑）：
+> 1. **`/root/vNN/aligned.apk` ≠ `/root/final/mgl-panvk-vNN.apk`**：
+>    前者是**打包中间件**（如 `/root/v54/aligned.apk` = `3fcd3b044cc818931c7f0939…`、
+>    `/root/v63/aligned.apk` = `3f29ad25f81977eaa885a62a…`），**不是发布件** ⇒ **台账一律以 `/root/final/` 为准**。
+> 2. **v56 / v62 的"驱动哈希"容易被误当成 APK 哈希**（截成 16 位前缀后尤其危险）：
+>    v56 APK = `1ecfb2ff…` **而** v56 驱动 = `d0476a0c…`；v62 APK = `36fe040f…` **而** v62 驱动 = `61d35b1c…`。
+>    **两者不要混用**（用前先看大小：APK ≈ 10 MB、驱动 ≈ 20 MB）。
+
+---
 
 ## F 相关文件
 

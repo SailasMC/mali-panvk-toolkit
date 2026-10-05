@@ -1,0 +1,32 @@
+[1/22] Generating src/git_sha1.h with a custom command
+[2/12] Compiling C object src/panfrost/vulkan/libpanvk_v11.a.p/csf_panvk_vX_gpu_queue.c.o
+../../work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c:830:7: warning: label followed by a declaration is a C23 extension [-Wc23-extensions]
+  830 |       int64_t now = os_time_get_nano();
+      |       ^
+1 warning generated.
+[3/12] Compiling C object src/panfrost/vulkan/libpanvk_v12.a.p/csf_panvk_vX_gpu_queue.c.o
+../../work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c:830:7: warning: label followed by a declaration is a C23 extension [-Wc23-extensions]
+  830 |       int64_t now = os_time_get_nano();
+      |       ^
+1 warning generated.
+[4/12] Compiling C object src/panfrost/vulkan/libpanvk_v10.a.p/csf_panvk_vX_gpu_queue.c.o
+../../work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c:830:7: warning: label followed by a declaration is a C23 extension [-Wc23-extensions]
+  830 |       int64_t now = os_time_get_nano();
+      |       ^
+1 warning generated.
+[5/12] Linking static target src/panfrost/vulkan/libpanvk_v10.a
+[6/12] Linking static target src/panfrost/vulkan/libpanvk_v11.a
+[7/12] Linking static target src/panfrost/vulkan/libpanvk_v12.a
+[8/12] Compiling C object src/panfrost/vulkan/libpanvk_v13.a.p/csf_panvk_vX_gpu_queue.c.o
+../../work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c:830:7: warning: label followed by a declaration is a C23 extension [-Wc23-extensions]
+  830 |       int64_t now = os_time_get_nano();
+      |       ^
+1 warning generated.
+[9/12] Linking static target src/panfrost/vulkan/libpanvk_v13.a
+[10/12] Compiling C object src/panfrost/vulkan/libpanvk_v14.a.p/csf_panvk_vX_gpu_queue.c.o
+../../work/mesa/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c:830:7: warning: label followed by a declaration is a C23 extension [-Wc23-extensions]
+  830 |       int64_t now = os_time_get_nano();
+      |       ^
+1 warning generated.
+[11/12] Linking static target src/panfrost/vulkan/libpanvk_v14.a
+[12/12] Linking target src/panfrost/vulkan/libvulkan_panfrost.so

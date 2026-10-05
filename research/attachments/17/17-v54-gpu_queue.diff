@@ -1,0 +1,55 @@
+--- src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c.bak-1791172414	2026-10-05 11:53:34.366794210 +0800
++++ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c	2026-10-05 11:53:54.403133998 +0800
+@@ -2777,9 +2777,15 @@
+       BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT);
+    /* Clear-only fragment submissions don't use the tiler heap.  Counting
+     * those towards renewal forces a graphics drain and heap replacement with
+-    * no memory to reclaim.  All draw paths, including indirect and secondary
+-    * command buffers, contribute a non-zero tiler work estimate. */
+-   if ((touched & graphics_mask) && submit->tiler_work_estimate) {
++    * no memory to reclaim.
++    *
++    * P2 / report 14 fix B: this gate used to also require
++    * submit->tiler_work_estimate, a field with no producer anywhere in this
++    * tree (panvk_cmd_buffer.h only declares it), so the counter never
++    * advanced and the heap could only grow until kbase terminated the CSG on
++    * -ENOMEM.  Count every graphics submission: the renewal interval then
++    * really means "every N graphics submissions". */
++   if (touched & graphics_mask) {
+       queue->kbase_tiler_submit_count++;
+       if (UINT64_MAX - queue->kbase_tiler_work_count <
+           submit->tiler_work_estimate)
+@@ -2789,10 +2795,13 @@
+    }
+ 
+    uint64_t renew_work = kbase_tiler_heap_renew_work();
+-   if (submit->tiler_work_estimate &&
+-       (queue->kbase_tiler_submit_count >=
+-           kbase_tiler_heap_renew_interval() ||
+-        (renew_work && queue->kbase_tiler_work_count >= renew_work))) {
++   /* P2 / report 14 fix B: the submit->tiler_work_estimate guard made this
++    * block unreachable (dead field), so PANVK_KBASE_HEAP_RENEW_INTERVAL never
++    * fired.  Renew on the submit interval; the work-threshold path is kept
++    * for whenever a producer for the estimate exists. */
++   if (queue->kbase_tiler_submit_count >= kbase_tiler_heap_renew_interval() ||
++       (submit->tiler_work_estimate && renew_work &&
++        queue->kbase_tiler_work_count >= renew_work)) {
+       /* Heap generations are referenced only by graphics streams.  Preserve
+        * overlap with unrelated compute work instead of draining every
+        * subqueue before replacing the tiler heap. */
+@@ -2801,6 +2810,15 @@
+       if (result != VK_SUCCESS)
+          return result;
+ 
++      /* P2 diagnostic: make both the renewal and the uAPI version actually
++       * negotiated at the kbase handshake visible in logcat. */
++      mesa_logi("kbase: tiler heap renewal (uAPI %u.%u, submits %u, "
++                "renew interval %u)",
++                dev->kmod.dev->driver.version.major,
++                dev->kmod.dev->driver.version.minor,
++                queue->kbase_tiler_submit_count,
++                kbase_tiler_heap_renew_interval());
++
+       result = kbase_renew_tiler_heap(queue);
+       if (result != VK_SUCCESS)
+          return vk_queue_set_lost(&queue->vk,

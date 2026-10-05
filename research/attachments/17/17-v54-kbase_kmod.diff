@@ -1,0 +1,28 @@
+--- src/panfrost/lib/kmod/kbase_kmod.c.bak-1791172414	2026-10-05 11:53:34.366794210 +0800
++++ src/panfrost/lib/kmod/kbase_kmod.c	2026-10-05 11:53:54.403133998 +0800
+@@ -513,6 +513,11 @@
+    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create_1_18) == 40);
+    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create) == 112);
+ 
++   /* v54 diagnostic: the version actually negotiated by the kernel at
++    * KBASE_IOCTL_VERSION_CHECK decides which layout rung below is taken. */
++   mesa_logi("kbase: CSF group_create: negotiated kernel uAPI %u.%u",
++             dev->driver.version.major, dev->driver.version.minor);
++
+    /* Endpoint masks/maxes match what panfork uses on all CSF parts:
+     * a single tiler unit, all fragment/compute endpoints.
+     *
+@@ -612,6 +617,13 @@
+       return -1;
+    }
+ 
++   /* v54 diagnostic: reaching this line means neither the 1.25 nor the 1.18
++    * rung was used, i.e. csi_handlers never reached the kernel and a tiler
++    * heap OOM will stay fatal. */
++   mesa_logi("kbase: created CSF group %u with the 1.6 ABI "
++             "(no csi_handlers: tiler OOM stays fatal)",
++             req.out.group_handle);
++
+    *group_handle = req.out.group_handle;
+    return 0;
+ }
