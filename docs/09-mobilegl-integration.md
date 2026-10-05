@@ -692,3 +692,70 @@ ZL2 会把它变成 `"$nativeLibraryDir/$lib"`，并在 dlopen 渲染器库**之
 ### 本轮现场
 设备已由协作者恢复为可用的 `versionCode 26 / 2.6-restore-good` 并熄屏；
 红线三件套（网易云 / Stellar / DSH）全程存活。
+
+---
+
+## 18. 进展到"只剩最后一个 Vulkan 调用"：`vkCreateDevice` 的 -3 追踪全记录
+
+### 18.1 已经确定的事实（按时间顺序，全部有原文证据）
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | 我们的 PanVK 是标准 ICD，可加载可用 | 探针：`deviceName: Mali-G720 MC12` / `apiVersion 1.4.363` / 181 扩展 |
+| 2 | 转发层（125 入口）已被 **静态链接进 MGL** | `readelf --dyn-syms`：UND vk* = **0** |
+| 3 | 转发层**必须**带 `DT_SONAME`；插件 lib 目录**不在** `clns-9` 的搜索路径 | §17(a)(c) |
+| 4 | 用 `pojavEnv: DLOPEN=<垫片>` 预加载是**正确且必要**的 | §17(b) |
+| 5 | **MGL 完整跑在我们的驱动上** | MGL 日志：`Enabled optional device extension: VK_EXT_vertex_attribute_divisor`（早先走 blob 时它是 `missing` ✗）；logcat：`vendor.mesa.panvk.debug` 属性探测 |
+| 6 | 转发层被 MGL 真正调用 | `/sdcard/MG/vkshim.log`：`vkCreateDevice: ext=11` + 11 个扩展名 + `features: 0x7b885f72b4` |
+| 7 | 11 个扩展在 panvk 里**全部可用** | MGL 日志逐个列出（含 `VK_EXT_host_query_reset (r.1)`、`VK_EXT_subgroup_size_control (r.2)`）|
+
+### 18.2 崩溃/错误的四次迁移（每次都前进一格）
+```
+libvulkan_freedreno.so wsi_GetSwapchainImagesKHR+0x20   ← 驱动 WSI（句柄域不一致）
+        ↓ 修：补 vk_icdGetPhysicalDeviceProcAddr 分派
+libMobileGL.so+0x961380（调用 NULL 函数指针）            ← MGL 内部
+        ↓ 修：三源回退（gp_inst/gp_dev）+ 123 项 thunk 表（loader 语义）
+Required extension found: VK_KHR_swapchain ✓             ← 扩展枚举正确了
+vkCreateDevice → VK_ERROR_INITIALIZATION_FAILED (-3)     ← 当前：建设备被拒
+```
+
+### 18.3 当前这一环的根因假设（已定位到代码逻辑）
+
+`vkCreateDevice` 的入参已拿到（11 扩展 + feature 位）。扩展全都可用 ⇒ 嫌疑集中在 **feature 位**：
+MGL 日志自己写着 `robustBufferAccess=false geometryShader=false …`，
+却仍按"支持"去建设备 ⇒ panvk 拒绝 ⇒ -3。
+
+MGL 的"支持"从哪来？**`vkGetPhysicalDeviceFeatures` 这类物理设备级查询**。
+而我们的 `gipa_pd()` 之前把 **instance GIPA 排在第一位**：
+```
+f = g_gipa(g_inst, name)      // ★ 错：对物理设备级函数会返回错的函数指针
+if(!f) f = g_pdpa(pd, name)   //    正解在这里，却排在后面
+```
+这正是早先 `apiVersion=540.1018.2112`、`viewport limit=1852401253` 这些**垃圾值**的来源。
+
+**修正（已实现并装进设备）**：
+```c
+static PFN_vkVoidFunction gipa_pd(VkPhysicalDevice pd, const char* n){
+  if(g_pdpa) f = g_pdpa(pd, n);          /* ★ 物理设备级优先 */
+  if(!f && g_gipa) f = g_gipa(g_inst, n);
+  return f;
+}
+```
+版本：`mgl-panvk-v39.apk` / `3.9-pdpa-first`，sha256 前缀 `1e4c231f`。
+
+### 18.4 验证方法（一条命令）
+```
+# shim 的落盘日志（不受 logcat 环形缓冲影响）
+cat /sdcard/MG/vkshim.log
+# MGL 的日志：是否还出现 vkCreateDevice FATAL
+tail -5 /sdcard/MG/latest.log
+# 最终判据
+grep -a "OpenGL Renderer" \
+  "/storage/emulated/0/Android/data/com.movtery.zalithlauncher.v2/files/.minecraft/versions/26.3 Fabric/ZalithLauncher/latest_game.log"
+#   期望：[OpenGL Renderer: Magma (MobileGL Core) (Mali-G720 MC12, Vulkan 1.4.363)]
+```
+
+### 18.5 若仍失败，下一个可做的动作
+1. 用 shim 打印**完整的 `VkPhysicalDeviceFeatures` 逐位值**，与 panvk 的支持表对比，找出被虚假置位的位；
+2. 或在 shim 里**对 `vkGetPhysicalDeviceFeatures` 加"仅走 pdpa"的强约束**并复测；
+3. 或写一个独立小探针，用我们的 ICD 分别以"只带 feature 子集"的方式反复 `vkCreateDevice`，二分出被拒的 feature。
