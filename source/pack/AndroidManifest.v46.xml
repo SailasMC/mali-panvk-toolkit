@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dsh.plugin.driver.g720" android:versionCode="46" android:versionName="4.6-wsi-diag">
+  <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+  <application android:label="MobileGL Magma + PanVK" android:extractNativeLibs="true">
+    <activity android:name="com.dsh.driverplugin.MainActivity" android:exported="true" android:label="MobileGL Magma + PanVK">
+      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+    </activity>
+    <meta-data android:name="fclPlugin" android:value="true" />
+    <meta-data android:name="des" android:value="MobileGL Magma + PanVK" />
+    <meta-data android:name="renderer" android:value="magma_panvk:libMobileGL.so:libMobileGL.so" />
+    <meta-data android:name="pojavEnv" android:value="LIBGL_ES=3:POJAV_RENDERER=opengles3:MOBILEGL_BACKEND_TYPE=DirectVulkan:MOBILEGL_ESPRYT_USE_ANGLE=0:MOBILEGL_MAGMA_R11G11B10F_FALLBACK=0" />
+    <meta-data android:name="boatEnv" android:value="LIBGL_ES=3:POJAV_RENDERER=opengles3:MOBILEGL_BACKEND_TYPE=DirectVulkan:MOBILEGL_ESPRYT_USE_ANGLE=0:MOBILEGL_MAGMA_R11G11B10F_FALLBACK=0" />
+    <meta-data android:name="minMCVer" android:value="1.17" />
+    <meta-data android:name="maxMCVer" android:value="" />
+  </application>
+</manifest>

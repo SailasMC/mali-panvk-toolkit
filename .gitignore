@@ -1,15 +1,97 @@
-# 构建产物与驱动二进制（不提交：许可 + 体积）
+# =============================================================================
+# mali-panvk-toolkit —— .gitignore
+#
+# 约定（见 README.md §6「每次进展都提交 git」）：
+#   **只把知识 / 源码 / 清单放进 git，不放大二进制。**
+#   进仓库的：.md / .c / .h / .py / .sh / .xml / .yml / 清单与台账
+#   不进仓库的：驱动 .so、APK、静态库、目标文件、构建目录、日志、临时备份
+#   产物替代物：登记到 MANIFEST.md（文件名 / 大小 / sha256 前缀 / 用途）
+# =============================================================================
+
+# --- 1. 大二进制：驱动与打包产物（体积 + 第三方/厂商许可）--------------------
 *.so
+*.so.*
 *.apk
+*.aab
+*.idsig
+*.dex
+*.jar
 *.o
 *.a
+*.d
+*.elf
+*.bin
+*.img
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
 
-# 只有在 repo 根之外出现的构建输出才忽略
+# --- 2. 构建目录与构建系统中间态 --------------------------------------------
+build/
+build-*/
 /out/
-/panvk-kbase-android/
-/work/
 /dist/
+/work/
+/panvk-kbase-android/
+/zenithblue/
+/mesa/
+/MobileGL/
+CMakeCache.txt
+CMakeFiles/
+ninja/
+.ninja_deps
+.ninja_log
+compile_commands.json
+meson-logs/
+meson-private/
+*.p/
+*.pc
 
-# GitHub Actions 工作流：模板放在 ci/ 下。
-# （推送 .github/workflows/** 需要 token 具备 workflow 权限，这里刻意不直接提交）
+# --- 3. 备份 / 临时 / 编辑器残留（★ 本项目踩过"改错文件"的坑）----------------
+*.bak
+*.bak.*
+*.bak-*
+*.bak_*
+*.orig
+*.rej
+*.save
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+.tmp/
+*.log
+*.log.*
+
+# --- 4. 设备侧取证与落盘日志（只应作为"结论"进 .md，不进原始文件）----------
+vkshim.log
+latest.log
+latest_game.log
+logcat*.txt
+dmesg*.txt
+
+# --- 5. 本地/环境相关（不放路径、设备序列号、凭据）--------------------------
+.credentials
+.env
+.env.*
+*.keystore
+*.jks
+*.pem
+*.key
+local.properties
+
+# --- 6. 系统与 IDE -----------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.iml
+
+# --- 7. GitHub Actions 工作流 -------------------------------------------------
+# 模板放在 ci/ 下（如 ci/build-panvk.yml.example）。
+# 推送 .github/workflows/** 需要 token 具备 workflow 权限，这里刻意不直接提交。
 .github/

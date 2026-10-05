@@ -1,0 +1,5 @@
+总符号: 125   泛型转发: 119   手写特殊: 6
+返回类型分布: {'VkResult': 52, 'void': 67}
+解析路径分布: {'device': 61, 'device_global': 42, 'instance': 3, 'physdev': 11, 'instance_create': 2}
+特殊函数: vkCreateDevice, vkCreateInstance, vkDestroyDevice, vkDestroyInstance, vkGetDeviceProcAddr, vkGetInstanceProcAddr
+未知返回类型(用 (T)0 兜底): 无
