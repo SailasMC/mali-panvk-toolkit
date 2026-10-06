@@ -1,0 +1,342 @@
+--- mtk/src/panfrost/lib/kmod/kbase_kmod.c	2026-10-05 11:32:13.295368883 +0800
++++ zb/src/panfrost/lib/kmod/kbase_kmod.c	2026-10-05 11:32:15.079368883 +0800
+@@ -58,6 +58,7 @@
+ #include "kbase_kmod.h"
+ #include "pan_kmod_backend.h"
+ #include "pan_props.h"
++#include "pan_trace.h"
+ 
+ /* Forward declaration — the full definition is at the end of this file. */
+ const struct pan_kmod_ops kbase_kmod_ops;
+@@ -122,7 +123,8 @@
+ 
+    /* GPU virtual address.  For SAME_VA allocations this equals the CPU
+     * mapping address; for EXEC_VA-zone allocations it is the address
+-    * returned by KBASE_IOCTL_MEM_ALLOC. */
++    * returned by KBASE_IOCTL_MEM_ALLOC; for NEED_MMAP (non-SAME_VA)
++    * dma-heap imports it is req.out.gpu_va with a separate CPU mapping. */
+    uint64_t gpu_va;
+ 
+    /* CPU mapping established at allocation time, valid for the whole BO
+@@ -146,6 +148,12 @@
+    /* Whether this is a SAME_VA region (freed by munmap()) or a zone
+     * region (freed by KBASE_IOCTL_MEM_FREE). */
+    bool same_va;
++
++   /* Whether the kernel reported BASE_MEM_COHERENT_SYSTEM for this region.
++    * Coherent regions need no KBASE_IOCTL_MEM_SYNC (which this DDK rejects
++    * for dma-heap imports with EINVAL); the kernel keeps CPU/GPU coherent.
++    */
++   bool cpu_gpu_coherent;
+ };
+ 
+ bool
+@@ -437,12 +445,14 @@
+     * and the scoreboard slot count in [15:8], but the encoding is not
+     * reliable across kbase/firmware versions (a Pixel 7 kbase 1.38
+     * reports a work register value that underflows the register file the
+-    * CS compiler was designed for).  Mirror the panthor kernel driver
+-    * instead, which hardcodes 96 CS registers with 4 unpreserved ones on
+-    * all shipping CSF parts, and only trust the scoreboard count when it
++    * CS compiler was designed for).  Like panthor, read WORK_REGS, but
++    * sanity-check it: shipping CSF parts have 96 (v10/v11) or 128 (v12+)
++    * CS registers, 4 of them unpreserved.  Resolve implausible counts once
++    * the architecture is known.  Only trust the scoreboard count when it
+     * is in the plausible [PANVK-supported] 1..16 range. */
+    uint32_t stream_features = streams[0].features;
+    uint32_t scoreboard_slot_count = (stream_features >> 8) & 0xff;
++   uint32_t cs_reg_count = (stream_features & 0xff) + 1;
+ 
+    mesa_logd("kbase: GLB iface: version 0x%x, features 0x%x, %u groups, "
+              "%u streams (stream 0: features 0x%x, group 0: %u streams, "
+@@ -454,7 +464,7 @@
+    *csif = (struct drm_panthor_csif_info){
+       .csg_slot_count = group_num,
+       .cs_slot_count = groups[0].stream_num,
+-      .cs_reg_count = 96,
++      .cs_reg_count = cs_reg_count,
+       .scoreboard_slot_count =
+          (scoreboard_slot_count - 1) < 16 ? scoreboard_slot_count : 8,
+       /* Number of CS registers the FW may clobber; matches panthor's
+@@ -584,7 +594,7 @@
+    }
+ }
+ 
+-static void
++static int
+ kbase_log_csf_notification(struct pan_kmod_dev *dev,
+                            const struct base_csf_notification *event)
+ {
+@@ -592,18 +602,18 @@
+ 
+    if (event->type == BASE_CSF_NOTIFICATION_EVENT) {
+       mesa_logd("kbase: received CSF event notification");
+-      return;
++      return 0;
+    }
+ 
+    if (event->type == BASE_CSF_NOTIFICATION_CPU_QUEUE_DUMP) {
+       mesa_logw("kbase: received CSF CPU queue dump notification");
+-      return;
++      return 0;
+    }
+ 
+    if (event->type != BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR) {
+       mesa_logw("kbase: received unknown CSF notification type %u",
+                 event->type);
+-      return;
++      return 0;
+    }
+ 
+    struct kbase_kmod_dev *kbase_dev =
+@@ -614,6 +624,8 @@
+    const struct base_gpu_queue_group_error *error =
+       &event->payload.csg_error.error;
+ 
++   int error_type = error->error_type + 1;
++
+    switch (error->error_type) {
+    case BASE_GPU_QUEUE_GROUP_ERROR_FATAL: {
+       const struct base_gpu_queue_group_error_fatal_payload *payload =
+@@ -660,6 +672,7 @@
+                 error->error_type);
+       break;
+    }
++   return error_type;
+ }
+ 
+ void
+@@ -804,9 +817,7 @@
+       return -1;
+    }
+ 
+-   kbase_log_csf_notification(dev, &event);
+-
+-   return 0;
++   return kbase_log_csf_notification(dev, &event);
+ }
+ 
+ static int
+@@ -837,7 +848,7 @@
+ 
+ int
+ kbase_kmod_csf_wait_cqs64(struct pan_kmod_dev *dev, uint64_t addr,
+-                           uint64_t target_minus_one, int64_t timeout_ns)
++                          uint64_t target_minus_one, int64_t timeout_ns)
+ {
+    struct kbase_kmod_dev *kbase_dev =
+       container_of(dev, struct kbase_kmod_dev, base);
+@@ -879,6 +890,9 @@
+          goto out;
+       } else {
+          ret = kbase_kcpu_poll_fence(kbase_dev->kcpu.fence_fd, timeout_ns);
++         if (ret < 0) {
++            mesa_loge("kbase: kbase_kcpu_poll_fence (%d) failed: %s", __LINE__, strerror(errno));
++         }
+          if (ret == 1) {
+             close(kbase_dev->kcpu.fence_fd);
+             kbase_dev->kcpu.fence_fd = -1;
+@@ -949,6 +963,7 @@
+       kbase_dev->kcpu.fence_fd = -1;
+       kbase_dev->kcpu.pending = false;
+    } else if (ret < 0) {
++      mesa_loge("kbase: kbase_kcpu_poll_fence failed: %s", strerror(errno));
+       goto disable;
+    }
+    goto out;
+@@ -966,6 +981,7 @@
+       ioctl(dev->fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &delete);
+       kbase_dev->kcpu.valid = false;
+    }
++   mesa_loge("kbase: kcpu queue disabled due to error");
+    ret = -1;
+ 
+ out:
+@@ -1266,7 +1282,7 @@
+    if (!dma_heap || !dma_heap[0])
+       dma_heap = "/dev/dma_heap/system";
+ 
+-   kbase_dev->dma_heap_fd = open(dma_heap, O_RDWR | O_CLOEXEC);
++   kbase_dev->dma_heap_fd = open(dma_heap, O_RDONLY | O_CLOEXEC);
+    if (kbase_dev->dma_heap_fd < 0)
+       mesa_logd("kbase: dma-heap unavailable at %s: %s", dma_heap,
+                 strerror(errno));
+@@ -1285,6 +1301,15 @@
+       return NULL;
+    }
+ 
++   if (is_csf && kbase_dev->csif_info.cs_reg_count != 96 &&
++       kbase_dev->csif_info.cs_reg_count != 128) {
++      uint32_t cs_reg_count =
++         pan_arch(kbase_dev->base.props.gpu_id) >= 12 ? 128 : 96;
++      mesa_logw("kbase: implausible CS work register count %u, using %u",
++                kbase_dev->csif_info.cs_reg_count, cs_reg_count);
++      kbase_dev->csif_info.cs_reg_count = cs_reg_count;
++   }
++
+    const char *kcpu_sync = getenv("PANVK_KBASE_KCPU_SYNC");
+    /* Keep this path opt-in for now.  A KCPU CQS wait needs two enqueue
+     * ioctls (shipping kernels accept one command per enqueue), which is a
+@@ -1440,6 +1465,16 @@
+    if (kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP)
+       import_flags |= BASE_MEM_CACHED_CPU;
+ 
++   /* Bring-up escape hatch: PANVK_KBASE_IMPORT_CLEAR/SET adjust the
++    * MEM_IMPORT flag word (hex masks) to probe DDK-specific import
++    * behavior without rebuilding. */
++   const char *clear_env = getenv("PANVK_KBASE_IMPORT_CLEAR");
++   const char *set_env = getenv("PANVK_KBASE_IMPORT_SET");
++   if (clear_env && clear_env[0])
++      import_flags &= ~strtoull(clear_env, NULL, 0);
++   if (set_env && set_env[0])
++      import_flags |= strtoull(set_env, NULL, 0);
++
+    int import_fd = kbase_bo->dmabuf_fd;
+    union kbase_ioctl_mem_import req = {
+       .in = {
+@@ -1455,8 +1490,15 @@
+    }
+ 
+    const uint64_t bo_size = req.out.va_pages * page_size;
++   /* SAME_VA and NEED_MMAP are different contracts (UAPI: SAME_VA regions
++    * return a mmap cookie and the mmap return address becomes both VAs;
++    * NEED_MMAP regions return a real GPU VA with a separate CPU mapping).
++    * Older DDKs report SAME_VA for dma-heap imports; this DDK (MediaTek,
++    * CSF uAPI 1.21) reports NEED_MMAP, so the cases must not be lumped. */
+    kbase_bo->same_va =
+       (req.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) != 0;
++   kbase_bo->cpu_gpu_coherent =
++      (req.out.flags & BASE_MEM_COHERENT_SYSTEM) != 0;
+ 
+    kbase_bo->gpu_mapping =
+       mmap(NULL, bo_size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
+@@ -1491,6 +1533,12 @@
+ 
+    pan_kmod_bo_init(&kbase_bo->base, dev, exclusive_vm, bo_size, flags,
+                     handle);
++   mesa_logi("kbase_kmod_bo_alloc_dmabuf: succeeded for %d, bo_size=%lu, handle=%u", kbase_bo->dmabuf_fd, bo_size, handle);
++   mesa_logi("kbase: import flags=0x%llx -> va=0x%llx pages=%llu outflags=0x%llx",
++             (unsigned long long)import_flags,
++             (unsigned long long)req.out.gpu_va,
++             (unsigned long long)req.out.va_pages,
++             (unsigned long long)req.out.flags);
+    return &kbase_bo->base;
+ 
+ err_unmap_gpu:
+@@ -1609,6 +1657,8 @@
+    }
+ 
+    kbase_bo->same_va = (alloc_flags & BASE_MEM_SAME_VA) != 0;
++   kbase_bo->cpu_gpu_coherent =
++      (alloc_flags & BASE_MEM_COHERENT_SYSTEM) != 0;
+ 
+    /* Establish the CPU mapping right away:
+     *  - for SAME_VA regions out.gpu_va is a cookie, and this mmap() is what
+@@ -1635,6 +1685,7 @@
+    kbase_bo->gpu_mapping = cpu_ptr;
+    kbase_bo->gpu_va = kbase_bo->same_va ? (uintptr_t)cpu_ptr : alloc_gpu_va;
+ 
++
+    /* Allocate a unique u32 handle for the pan_kmod handle_to_bo table. */
+    uint32_t handle = p_atomic_inc_return(&kbase_dev->next_handle);
+ 
+@@ -1725,8 +1776,15 @@
+ }
+ 
+ /* Return the CPU mapping established at allocation time.  A SAME_VA region
+- * has exactly one CPU mapping (its address is the GPU VA), so we cannot
+- * honor requests for a caller-chosen address. */
++ * has exactly one CPU mapping and kbase's get_unmapped_area rejects both
++ * MAP_FIXED and mremap(MREMAP_FIXED) (measured on G615: EINVAL).  A
++ * caller-chosen address (VK_EXT_map_memory_placed, 32-bit WoW64 needs
++ * < 4 GiB) therefore only works for dma-buf backed BOs: the dma-buf is mapped
++ * a second time at that address, sharing pages with the GPU (no copy, no
++ * sync).  panvk allocates host-visible memory from the dma-heap when the app
++ * enables memoryMapPlaced (patch 091).
++ * ponytail: without /dev/dma_heap placed maps fail (ENOTSUP); an anonymous
++ * shadow copy needs dirty tracking to be both correct and fast. */
+ static void *
+ kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, UNUSED int prot, UNUSED int flags,
+                    void *host_addr)
+@@ -1734,27 +1792,42 @@
+    struct kbase_kmod_bo *kbase_bo =
+       container_of(bo, struct kbase_kmod_bo, base);
+ 
+-   if (host_addr != NULL && host_addr != kbase_bo->cpu_ptr) {
+-      mesa_loge("kbase: mapping a BO at a caller-chosen address is not "
+-                "supported (SAME_VA)");
+-      errno = ENOTSUP;
++   if (!kbase_bo->cpu_ptr) {
++      errno = EINVAL;
+       return MAP_FAILED;
+    }
+ 
+-   if (!kbase_bo->cpu_ptr) {
+-      errno = EINVAL;
++   if (host_addr == NULL || host_addr == kbase_bo->cpu_ptr)
++      return kbase_bo->cpu_ptr;
++
++   if (kbase_bo->dmabuf_fd < 0) {
++      mesa_loge("kbase: placed map of a non-dma-buf BO is not supported");
++      errno = ENOTSUP;
+       return MAP_FAILED;
+    }
+ 
+-   return kbase_bo->cpu_ptr;
++   /* MAP_FIXED is the VK_EXT_map_memory_placed contract: the range is the
++    * caller's (usually a PROT_NONE reservation). */
++   void *p = mmap(host_addr, bo->size, PROT_READ | PROT_WRITE,
++                  MAP_SHARED | MAP_FIXED, kbase_bo->dmabuf_fd, 0);
++   if (p == MAP_FAILED)
++      mesa_loge("kbase: placed dma-buf mmap at %p failed: %s", host_addr,
++                strerror(errno));
++   return p;
+ }
+ 
+-/* The mapping belongs to the BO and lives until bo_free: unmapping a
+- * SAME_VA region would free its GPU mapping too. */
++/* Normally the mapping belongs to the BO and lives until bo_free: unmapping
++ * a SAME_VA region would free its GPU mapping too.  Only a placed dma-buf
++ * alias (any other address) is unmapped. */
+ static int
+-kbase_kmod_bo_munmap(UNUSED struct pan_kmod_bo *bo, UNUSED void *host_addr,
+-                     UNUSED size_t size)
++kbase_kmod_bo_munmap(struct pan_kmod_bo *bo, void *host_addr, size_t size)
+ {
++   struct kbase_kmod_bo *kbase_bo =
++      container_of(bo, struct kbase_kmod_bo, base);
++
++   if (host_addr && host_addr != kbase_bo->cpu_ptr &&
++       host_addr != kbase_bo->gpu_mapping)
++      return munmap(host_addr, size);
+    return 0;
+ }
+ 
+@@ -1783,16 +1856,23 @@
+       struct kbase_kmod_bo *kbase_bo =
+          container_of(sync->bo, struct kbase_kmod_bo, base);
+ 
++      const bool flush = sync->type == PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH;
++
++      /* System-coherent regions (dma-heap imports on DDKs that report
++       * BASE_MEM_COHERENT_SYSTEM) need no MEM_SYNC; the ioctl rejects
++       * them with EINVAL. */
++      if (kbase_bo->cpu_gpu_coherent)
++         continue;
++
+       struct kbase_ioctl_mem_sync req = {
+          .handle = kbase_bo->gpu_va,
+          .user_addr = (uintptr_t)kbase_bo->cpu_ptr + sync->start,
+          .size = sync->size,
+-         .type = sync->type == PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH
+-                    ? BASE_SYNCSET_OP_MSYNC
+-                    : BASE_SYNCSET_OP_CSYNC,
++         .type = flush ? BASE_SYNCSET_OP_MSYNC : BASE_SYNCSET_OP_CSYNC,
+       };
+ 
+-      if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
++      int ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_SYNC, &req);
++      if (ret) {
+          mesa_loge("kbase: KBASE_IOCTL_MEM_SYNC failed: %s", strerror(errno));
+          return -1;
+       }

@@ -1,0 +1,653 @@
+--- mtk/src/panfrost/vulkan/panvk_physical_device.c	2026-10-05 11:32:20.951368884 +0800
++++ zb/src/panfrost/vulkan/panvk_physical_device.c	2026-10-05 11:32:23.047368884 +0800
+@@ -11,19 +11,20 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
+-#include <sched.h>
+-#include <errno.h>
+-#include <stdlib.h>
+-#include <string.h>
+ #include <sys/stat.h>
+-#include <sys/sysinfo.h>
++
++#if defined(HAVE_PAN_KMOD_KBASE)
++#include <errno.h>
+ #include <fcntl.h>
++#include <poll.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include "util/timespec.h"
++#endif
+ 
+ #include "util/disk_cache.h"
+-#include "util/cnd_monotonic.h"
+ #include "util/os_misc.h"
+-#include "util/os_time.h"
+-#include "util/timespec.h"
+ #include "util/u_atomic.h"
+ #include "git_sha1.h"
+ 
+@@ -44,6 +45,7 @@
+ #include "panvk_wsi.h"
+ 
+ #include "pan_afbc.h"
++#include "pan_compiler.h"
+ #include "pan_props.h"
+ 
+ #include "genxml/gen_macros.h"
+@@ -75,6 +77,7 @@
+ PER_ARCH_FUNCS(6);
+ PER_ARCH_FUNCS(7);
+ PER_ARCH_FUNCS(10);
++PER_ARCH_FUNCS(11);
+ PER_ARCH_FUNCS(12);
+ PER_ARCH_FUNCS(13);
+ PER_ARCH_FUNCS(14);
+@@ -437,16 +440,17 @@
+    memcpy(device->cache_uuid, blake3, VK_UUID_SIZE);
+ 
+ #ifdef ENABLE_SHADER_CACHE
++   const uint64_t gpu_id = device->kmod.dev->props.gpu_id;
++
+    char renderer[25];
+    ASSERTED int len =
+-      snprintf(renderer, sizeof(renderer), "panvk_0x%016" PRIx64,
+-               device->kmod.dev->props.gpu_id);
++      snprintf(renderer, sizeof(renderer), "panvk_0x%016" PRIx64, gpu_id);
+    assert(len == sizeof(renderer) - 1);
+ 
+    char timestamp[BLAKE3_HEX_LEN];
+    _mesa_blake3_format(timestamp, instance->driver_build_sha);
+ 
+-   const uint64_t driver_flags = 0;
++   const uint64_t driver_flags = pan_get_compiler_flags(pan_arch(gpu_id));
+    device->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+ #endif
+ }
+@@ -540,6 +544,15 @@
+       };
+    }
+ 
++   assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
++   host_coherent_not_cached_idx = device->memory.type_count;
++   device->memory.types[device->memory.type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++      .heapIndex = 0,
++   };
++
+    if (!PANVK_DEBUG(NO_WB_MMAP) &&
+        (device->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_WB_MMAP)) {
+       assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
+@@ -552,26 +565,18 @@
+       };
+    }
+ 
+-   assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
+-   host_coherent_not_cached_idx = device->memory.type_count;
+-   device->memory.types[device->memory.type_count++] = (VkMemoryType) {
+-      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+-      .heapIndex = 0,
+-   };
+-
+    /* Ideally, we'd place HOST_CACHED first for perf reasons, but there's
+     * so many broken CTS tests (missing or invalid flush/invalidate
+     * calls), and so many added at each version that it gets impossible to
+     * catch up. So, keep things ordered in a way that the first HOST_VISIBLE
+     * type is also the one requiring no CPU cache maintenance if we're asked
+-    * to.
++    * to. The cached_before_coherent debug option is left to help investigate
++    * cpu cache related perf issues.
+     */
+-   if (PANVK_DEBUG(COHERENT_BEFORE_CACHED) &&
++   if (PANVK_DEBUG(CACHED_BEFORE_COHERENT) &&
+        host_cached_not_coherent_idx != -1 &&
+        host_coherent_not_cached_idx != -1 &&
+-       host_coherent_not_cached_idx > host_cached_not_coherent_idx) {
++       host_coherent_not_cached_idx < host_cached_not_coherent_idx) {
+       VkMemoryType host_cached_not_coherent_type =
+          device->memory.types[host_cached_not_coherent_idx];
+ 
+@@ -669,9 +674,13 @@
+ }
+ 
+ static void
++kbase_sync_file_waiter_free(struct kbase_cpu_sync *ks);
++
++static void
+ kbase_cpu_sync_finish(UNUSED struct vk_device *device, struct vk_sync *sync)
+ {
+    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++   kbase_sync_file_waiter_free(ks);
+    u_cnd_monotonic_destroy(&ks->cond);
+    mtx_destroy(&ks->mutex);
+ }
+@@ -882,6 +891,197 @@
+    return VK_SUCCESS;
+ }
+ 
++struct kbase_sync_file_waiter {
++   int fd;
++};
++
++static VkResult
++kbase_sync_file_wait_func(void *data, UNUSED const uint64_t *targets,
++                          uint64_t abs_timeout_ns)
++{
++   struct kbase_sync_file_waiter *waiter = data;
++   if (waiter->fd < 0)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++   int timeout_ms;
++   if (abs_timeout_ns == 0xFFFFFFFFFFFFFFFFULL) {
++      timeout_ms = -1;
++   } else {
++      uint64_t now = os_time_get_nano();
++      if (abs_timeout_ns <= now)
++         timeout_ms = 0;
++      else
++         timeout_ms = (int)((abs_timeout_ns - now) / 1000000ull);
++   }
++
++   struct pollfd pfd = {
++      .fd = waiter->fd,
++      .events = POLLIN | POLLERR | POLLHUP,
++   };
++
++   while (true) {
++      int ret = poll(&pfd, 1, timeout_ms);
++      if (ret > 0) {
++         if (pfd.revents & (POLLERR | POLLHUP))
++            return VK_ERROR_DEVICE_LOST;
++         return VK_SUCCESS;
++      } else if (ret == 0) {
++         return VK_TIMEOUT;
++      } else if (errno != EINTR && errno != EAGAIN) {
++         return VK_ERROR_UNKNOWN;
++      }
++   }
++}
++
++static void
++kbase_sync_file_waiter_free(struct kbase_cpu_sync *ks)
++{
++   if (ks->pending_wait == kbase_sync_file_wait_func && ks->pending_data) {
++      struct kbase_sync_file_waiter *waiter = ks->pending_data;
++      if (waiter->fd >= 0)
++         close(waiter->fd);
++      free(waiter);
++      ks->pending_data = NULL;
++      ks->pending_wait = NULL;
++   }
++}
++
++static VkResult
++kbase_cpu_sync_import_sync_file(struct vk_device *device,
++                                struct vk_sync *sync,
++                                int sync_file)
++{
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++
++   if (sync_file < 0) {
++      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "Invalid sync_file fd: %d", sync_file);
++   }
++
++   int fd = dup(sync_file);
++   if (fd < 0)
++      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY, "dup() failed: %m");
++
++   struct kbase_sync_file_waiter *waiter = malloc(sizeof(*waiter));
++   if (!waiter) {
++      close(fd);
++      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY, "allocation failed");
++   }
++   waiter->fd = fd;
++
++   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT] = {0};
++
++   mtx_lock(&ks->mutex);
++   kbase_sync_file_waiter_free(ks);
++   mtx_unlock(&ks->mutex);
++
++   panvk_kbase_sync_set_pending(sync, waiter, kbase_sync_file_wait_func, targets);
++
++   return VK_SUCCESS;
++}
++
++#ifndef SW_SYNC_IOC_CREATE_FENCE
++struct sw_sync_create_fence_data {
++   __u32 value;
++   char name[32];
++   __s32 fence;
++};
++#define SW_SYNC_IOC_MAGIC 'W'
++#define SW_SYNC_IOC_CREATE_FENCE _IOWR(SW_SYNC_IOC_MAGIC, 0, struct sw_sync_create_fence_data)
++#define SW_SYNC_IOC_INC          _IOW(SW_SYNC_IOC_MAGIC, 1, __u32)
++#endif
++
++static void *
++kbase_export_signaler_thread(void *arg)
++{
++   struct {
++      struct vk_device *device;
++      struct kbase_cpu_sync *ks;
++      int timeline_fd;
++   } *ctx = arg;
++
++   struct vk_sync_wait wait = {
++      .sync = &ctx->ks->sync,
++      .wait_value = 0,
++   };
++
++   VkResult res = kbase_cpu_sync_wait_many(ctx->device, 1, &wait,
++                                           VK_SYNC_WAIT_COMPLETE,
++                                           0xFFFFFFFFFFFFFFFFULL);
++   if (res == VK_SUCCESS) {
++      uint32_t inc = 1;
++      ioctl(ctx->timeline_fd, SW_SYNC_IOC_INC, &inc);
++   }
++
++   close(ctx->timeline_fd);
++   free(ctx);
++   return NULL;
++}
++
++static VkResult
++kbase_cpu_sync_export_sync_file(struct vk_device *device,
++                                struct vk_sync *sync,
++                                int *sync_file)
++{
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++
++   /* If already signaled, return an already-signaled sync_file FD using sw_sync */
++   int timeline_fd = open("/dev/sw_sync", O_RDWR | O_CLOEXEC);
++   if (timeline_fd < 0) {
++      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY,
++                       "Failed to open /dev/sw_sync: %m");
++   }
++
++   struct sw_sync_create_fence_data create_fence = {
++      .value = 1,
++      .name = "panvk_signal_fence",
++      .fence = -1,
++   };
++
++   if (ioctl(timeline_fd, SW_SYNC_IOC_CREATE_FENCE, &create_fence) < 0) {
++      close(timeline_fd);
++      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY,
++                       "SW_SYNC_IOC_CREATE_FENCE failed: %m");
++   }
++
++   mtx_lock(&ks->mutex);
++   bool already_signaled = (ks->state == KBASE_CPU_SYNC_SIGNALED);
++   mtx_unlock(&ks->mutex);
++
++   if (already_signaled) {
++      uint32_t inc = 1;
++      ioctl(timeline_fd, SW_SYNC_IOC_INC, &inc);
++      close(timeline_fd);
++      *sync_file = create_fence.fence;
++      return VK_SUCCESS;
++   }
++
++   /* Spawn worker thread to signal fence when CPU sync completes */
++   pthread_t thread;
++   typedef void *(*pthread_func)(void *);
++
++   struct {
++      struct vk_device *device;
++      struct kbase_cpu_sync *ks;
++      int timeline_fd;
++   } *ctx = malloc(sizeof(*ctx));
++
++   ctx->device = device;
++   ctx->ks = ks;
++   ctx->timeline_fd = timeline_fd;
++
++   if (pthread_create(&thread, NULL, (pthread_func)kbase_export_signaler_thread, ctx) != 0) {
++      free(ctx);
++      close(create_fence.fence);
++      close(timeline_fd);
++      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY, "pthread_create failed");
++   }
++   pthread_detach(thread);
++
++   *sync_file = create_fence.fence;
++   return VK_SUCCESS;
++}
++
+ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .size      = sizeof(struct kbase_cpu_sync),
+    .features  = VK_SYNC_FEATURE_BINARY |
+@@ -898,6 +1098,8 @@
+    .reset     = kbase_cpu_sync_reset,
+    .wait_many = kbase_cpu_sync_wait_many,
+    .move      = kbase_cpu_sync_move,
++   .import_sync_file = kbase_cpu_sync_import_sync_file,
++   .export_sync_file = kbase_cpu_sync_export_sync_file,
+ };
+ 
+ /* Set up sync types for a kbase (non-DRM) physical device.
+@@ -952,55 +1154,34 @@
+    vk_physical_device_finish(&device->vk);
+ }
+ 
+-/* Resolve the pan_model for a probed device.  GPUs missing from the model
+- * table get conservative per-arch defaults instead of being rejected;
+- * *unknown_gpu is set so callers can reflect that in the device name. */
+-static VkResult
+-get_gpu_model(struct panvk_physical_device *device,
+-              const struct panvk_instance *instance, bool *unknown_gpu)
+-{
+-   const struct pan_kmod_dev_props *props = &device->kmod.dev->props;
+-
+-   *unknown_gpu = false;
+-   device->model = pan_get_model(props->gpu_id, props->gpu_variant);
+-   if (device->model)
+-      return VK_SUCCESS;
+-
+-   device->model = pan_get_fallback_model(props->gpu_id);
+-   if (!device->model) {
+-      return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+-                          "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
+-                          props->gpu_id, props->gpu_variant);
+-   }
+-
+-   *unknown_gpu = true;
+-   mesa_logw("panvk: unknown gpu_id (%#" PRIx64 ") or variant (%#x); "
+-             "continuing with conservative \"%s\" defaults — expect issues",
+-             props->gpu_id, props->gpu_variant, device->model->name);
+-   return VK_SUCCESS;
+-}
+-
+ VkResult
+ panvk_physical_device_init(struct panvk_physical_device *device,
+                            struct panvk_instance *instance,
+                            drmDevicePtr drm_device)
+ {
+    VkResult result;
+-   bool unknown_gpu;
+ 
+    result = create_kmod_dev(device, instance, drm_device);
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   device->model = pan_get_model(device->kmod.dev->props.gpu_id,
++                                 device->kmod.dev->props.gpu_variant);
++
+    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+ 
+-   result = get_gpu_model(device, instance, &unknown_gpu);
+-   if (result != VK_SUCCESS)
++   if (!device->model) {
++      result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
++                            "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
++                            device->kmod.dev->props.gpu_id,
++                            device->kmod.dev->props.gpu_variant);
+       goto fail;
++   }
+ 
+    switch (arch) {
+    case 6:
+    case 7:
++   case 11:
+    case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+@@ -1033,12 +1214,7 @@
+       pan_query_core_count(&device->kmod.dev->props);
+ 
+    memset(device->name, 0, sizeof(device->name));
+-   if (unknown_gpu)
+-      snprintf(device->name, sizeof(device->name),
+-               "Mali unknown 0x%" PRIx64 " MC%u",
+-               device->kmod.dev->props.gpu_id, core_count);
+-   else
+-      sprintf(device->name, "%s MC%u", device->model->name, core_count);
++   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+ 
+    result = get_core_masks(device, instance);
+    if (result != VK_SUCCESS)
+@@ -1121,17 +1297,22 @@
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   device->model = pan_get_model(device->kmod.dev->props.gpu_id,
++                                 device->kmod.dev->props.gpu_variant);
++
+    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+ 
+-   bool unknown_gpu;
+-   result = get_gpu_model(device, instance, &unknown_gpu);
+-   if (result != VK_SUCCESS)
++   if (!device->model) {
++      result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
++                            "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
++                            device->kmod.dev->props.gpu_id,
++                            device->kmod.dev->props.gpu_variant);
+       goto fail_kbase;
++   }
+ 
+    switch (arch) {
+    case 6:
+    case 7:
+-   case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                                "WARNING: panvk is not well-tested on v%d, "
+@@ -1142,8 +1323,10 @@
+       break;
+ 
+    case 10:
++   case 11:
+    case 12:
+    case 13:
++   case 14:
+       break;
+ 
+    default:
+@@ -1162,12 +1345,7 @@
+       pan_query_core_count(&device->kmod.dev->props);
+ 
+    memset(device->name, 0, sizeof(device->name));
+-   if (unknown_gpu)
+-      snprintf(device->name, sizeof(device->name),
+-               "Mali unknown 0x%" PRIx64 " MC%u",
+-               device->kmod.dev->props.gpu_id, core_count);
+-   else
+-      sprintf(device->name, "%s MC%u", device->model->name, core_count);
++   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+ 
+    result = get_core_masks(device, instance);
+    if (result != VK_SUCCESS)
+@@ -1335,6 +1513,113 @@
+    }
+ }
+ 
++VKAPI_ATTR VkResult VKAPI_CALL
++panvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
++   VkCooperativeMatrixPropertiesKHR *pProperties)
++{
++   VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
++   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
++                          pPropertyCount);
++
++   unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
++
++   if (arch < 11)
++      return VK_SUCCESS;
++
++   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
++      *p = (VkCooperativeMatrixPropertiesKHR){
++         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
++         .MSize = 4,
++         .NSize = 4,
++         .KSize = 4,
++         .AType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .BType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .saturatingAccumulation = false,
++         .scope = VK_SCOPE_SUBGROUP_KHR,
++      };
++   }
++
++   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
++      *p = (VkCooperativeMatrixPropertiesKHR){
++         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
++         .MSize = 16,
++         .NSize = 16,
++         .KSize = 16,
++         .AType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .BType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .saturatingAccumulation = false,
++         .scope = VK_SCOPE_SUBGROUP_KHR,
++      };
++   }
++
++   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
++      *p = (VkCooperativeMatrixPropertiesKHR){
++         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
++         .MSize = 4,
++         .NSize = 8,
++         .KSize = 8,
++         .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
++         .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
++         .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .saturatingAccumulation = false,
++         .scope = VK_SCOPE_SUBGROUP_KHR,
++      };
++   }
++
++   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
++      *p = (VkCooperativeMatrixPropertiesKHR){
++         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
++         .MSize = 16,
++         .NSize = 32,
++         .KSize = 32,
++         .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
++         .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
++         .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
++         .saturatingAccumulation = false,
++         .scope = VK_SCOPE_SUBGROUP_KHR,
++      };
++   }
++
++   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
++      *p = (VkCooperativeMatrixPropertiesKHR){
++         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
++         .MSize = 4,
++         .NSize = 16,
++         .KSize = 16,
++         .AType = VK_COMPONENT_TYPE_SINT8_KHR,
++         .BType = VK_COMPONENT_TYPE_SINT8_KHR,
++         .CType = VK_COMPONENT_TYPE_SINT32_KHR,
++         .ResultType = VK_COMPONENT_TYPE_SINT32_KHR,
++         .saturatingAccumulation = false,
++         .scope = VK_SCOPE_SUBGROUP_KHR,
++      };
++   }
++
++   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
++      *p = (VkCooperativeMatrixPropertiesKHR){
++         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
++         .MSize = 4,
++         .NSize = 16,
++         .KSize = 16,
++         .AType = VK_COMPONENT_TYPE_UINT8_KHR,
++         .BType = VK_COMPONENT_TYPE_UINT8_KHR,
++         .CType = VK_COMPONENT_TYPE_UINT32_KHR,
++         .ResultType = VK_COMPONENT_TYPE_UINT32_KHR,
++         .saturatingAccumulation = false,
++         .scope = VK_SCOPE_SUBGROUP_KHR,
++      };
++   }
++
++   return vk_outarray_status(&out);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_GetPhysicalDeviceMemoryProperties2(
+    VkPhysicalDevice physicalDevice,
+@@ -1356,10 +1641,10 @@
+           physical_device->memory.types[i];
+    }
+ 
+-   vk_foreach_struct(ext, pMemoryProperties->pNext) {
+-      switch (ext->sType) {
++   vk_foreach_struct(sType, ext, pMemoryProperties->pNext) {
++      switch (sType) {
+       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
+-         VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = (void *)ext;
++         VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = ext;
+ 
+          uint64_t used = p_atomic_read(&physical_device->memory.heap_used);
+          uint64_t heap_size = physical_device->memory.heaps[0].size;
+@@ -1392,7 +1677,7 @@
+          break;
+       }
+       default:
+-         vk_debug_ignored_stype(ext->sType);
++         vk_debug_ignored_stype(sType);
+          break;
+       }
+    }
+@@ -2152,16 +2437,16 @@
+       return result;
+ 
+    /* Extract input structs */
+-   vk_foreach_struct_const(s, base_info->pNext) {
+-      switch (s->sType) {
++   vk_foreach_struct_const(sType, s, base_info->pNext) {
++      switch (sType) {
+       case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
+-         stencil_usage_info = (const void*)s;
++         stencil_usage_info = s;
+          break;
+       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO:
+-         external_info = (const void *)s;
++         external_info = s;
+          break;
+       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT:
+-         image_view_info = (const void *)s;
++         image_view_info = s;
+          break;
+       default:
+          break;
+@@ -2169,19 +2454,19 @@
+    }
+ 
+    /* Extract output structs */
+-   vk_foreach_struct(s, base_props->pNext) {
+-      switch (s->sType) {
++   vk_foreach_struct(sType, s, base_props->pNext) {
++      switch (sType) {
+       case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES:
+-         external_props = (void *)s;
++         external_props = s;
+          break;
+       case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT:
+-         cubic_props = (void *)s;
++         cubic_props = s;
+          break;
+       case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY:
+-         hic_props = (void *)s;
++         hic_props = s;
+          break;
+       case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES:
+-         ycbcr_props = (void *)s;
++         ycbcr_props = s;
+          break;
+       default:
+          break;

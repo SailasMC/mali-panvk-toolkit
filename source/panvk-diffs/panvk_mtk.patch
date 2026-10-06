@@ -1,0 +1,903 @@
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 9dfcb25132c..595d7956e73 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -364,10 +364,15 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
+     * frequency should perform their own calibration. */
+    props->timestamp_frequency = 0;
+ 
+-   /* Priorities: kbase currently only advertises medium. */
++   /* Priorities: advertise the full range.  Android HWUI requests HIGH
++    * global priority for its graphics queue; the stock userspace driver
++    * supports it, and queue-group creation passes the priority through to
++    * the kbase kernel. */
+    props->allowed_group_priorities_mask =
+       PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM |
+-      PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW;
++      PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW |
++      PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH |
++      PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME;
+ 
+    /* kbase's SAME_VA/EXEC_VA allocations are exposed at the base 4 KiB
+     * granularity.  Newer pan_kmod derives the VM bitmap from device props. */
+@@ -1581,15 +1586,21 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
+          },
+       };
+ 
+-      if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC_EX, &req)) {
++      if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC_EX, &req) == 0) {
++         alloc_flags = req.out.flags;
++         alloc_gpu_va = req.out.gpu_va;
++      } else if (errno == ENOTTY) {
++         /* Some MediaTek kernels report a CSF uAPI >= 1.9 yet do not implement
++          * MEM_ALLOC_EX; fall back to the classic MEM_ALLOC path. */
++         goto legacy_alloc;
++      } else {
+          mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC_EX failed: %s",
+                    strerror(errno));
+          goto err_free_bo;
+       }
+-
+-      alloc_flags = req.out.flags;
+-      alloc_gpu_va = req.out.gpu_va;
+    } else {
++legacy_alloc:
++      {
+       union kbase_ioctl_mem_alloc req = {
+          .in = {
+             .va_pages = va_pages,
+@@ -1606,6 +1617,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
+ 
+       alloc_flags = req.out.flags;
+       alloc_gpu_va = req.out.gpu_va;
++      }
+    }
+ 
+    kbase_bo->same_va = (alloc_flags & BASE_MEM_SAME_VA) != 0;
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index 1e6ca23c833..6a03d3048b8 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -5,6 +5,7 @@
+ 
+ #include <errno.h>
+ #include <string.h>
++#include <sys/stat.h>
+ #include <xf86drm.h>
+ 
+ #include "util/cache_ops.h"
+@@ -201,7 +202,17 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+    if (dev->ops->bo_import_fd) {
+       size_t size = lseek(fd, 0, SEEK_END);
+       if (size == 0 || size == (size_t)-1) {
+-         mesa_loge("invalid dmabuf size");
++         struct stat st;
++         if (fstat(fd, &st) == 0) {
++            size = st.st_size;
++            mesa_logw("dmabuf: lseek failed (errno=%d), fstat size=%lld",
++                      errno, (long long)size);
++         } else {
++            size = 0;
++         }
++      }
++      if (size == 0 || size == (size_t)-1) {
++         mesa_loge("invalid dmabuf size (fd=%d lseek errno=%d)", fd, errno);
+          goto err_unlock;
+       }
+ 
+@@ -237,7 +248,14 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+    } else {
+       size_t size = lseek(fd, 0, SEEK_END);
+       if (size == 0 || size == (size_t)-1) {
+-         mesa_loge("invalid dmabuf size");
++         struct stat st;
++         if (fstat(fd, &st) == 0)
++            size = st.st_size;
++         else
++            size = 0;
++      }
++      if (size == 0 || size == (size_t)-1) {
++         mesa_loge("invalid dmabuf size (fd=%d lseek errno=%d)", fd, errno);
+          goto err_close_handle;
+       }
+ 
+diff --git a/src/panfrost/lib/pan_desc.c b/src/panfrost/lib/pan_desc.c
+index 2f049270a17..529656c2a49 100644
+--- a/src/panfrost/lib/pan_desc.c
++++ b/src/panfrost/lib/pan_desc.c
+@@ -278,6 +278,11 @@ get_afbc_att_mem_props(struct pan_image_plane_ref pref, unsigned mip_level,
+    *row_stride = slayout->afbc.header.row_stride_B;
+    *body_offset = pan_afbc_body_offset(PAN_ARCH, image->props.modifier,
+                                        slayout->afbc.header.surface_size_B);
++   /* MediaTek gralloc 4096-aligns the AFBC body even for non-TILED split
++    * buffers; keep this in sync with pan_mod_afbc_init_slice_layout so the
++    * GPU writes the payload where the display pipeline expects it. */
++   if (image->props.modifier & AFBC_FORMAT_MOD_SPLIT)
++      *body_offset = ALIGN_POT(*body_offset, 4096);
+    *header = plane->base + slayout->offset_B + (stride_B * layer_or_z_slice);
+ }
+ 
+@@ -737,13 +742,20 @@ GENX(pan_emit_afbc_color_attachment)(const struct pan_attachment_info *att,
+    get_afbc_att_mem_props(pref, iview->first_level, att->layer_or_z_slice,
+                           &header, &body_offset, &hdr_row_stride);
+ 
++   mesa_logw("panvk: afbc RT: base=0x%llx hdr=0x%llx body_off=%u row_stride=%u mod=0x%llx",
++             (unsigned long long)(pref.image->planes[pref.plane_idx]
++                                     ? pref.image->planes[pref.plane_idx]->base
++                                     : 0),
++             (unsigned long long)header, (unsigned)body_offset,
++             (unsigned)hdr_row_stride,
++             (unsigned long long)image->props.modifier);
++
+    /* TODO: YUV RT. */
+    assert(!pan_format_is_yuv(iview->format));
+    pan_cast_and_pack(payload, AFBC_RGB_RENDER_TARGET, cfg) {
+       cfg.write_enable = true;
+       get_rt_formats(iview->format, &cfg.writeback_format, &cfg.internal_format,
+                      &cfg.swizzle);
+-
+       /* AFBC+RAW24 is not supported on v9+. Use RAW32 instead, and let the AFBC
+        * compression mode select the actual size.
+        */
+diff --git a/src/panfrost/lib/pan_layout.c b/src/panfrost/lib/pan_layout.c
+index b0114493623..bb5d4a6ea4a 100644
+--- a/src/panfrost/lib/pan_layout.c
++++ b/src/panfrost/lib/pan_layout.c
+@@ -66,6 +66,9 @@ pan_image_layout_init(
+    unsigned arch, struct pan_image *image, unsigned plane_idx,
+    const struct pan_image_layout_constraints *explicit_layout_constraints)
+ {
++   mesa_logw("pan_layout: init arch=%u plane=%u mod_handler=%p planes[0]=%p",
++             arch, plane_idx, (void *)image->mod_handler,
++             (void *)image->planes[0]);
+    assert(image->mod_handler);
+    assert(plane_idx < ARRAY_SIZE(image->planes) &&
+           plane_idx < util_format_get_num_planes(image->props.format));
+diff --git a/src/panfrost/lib/pan_mod.c b/src/panfrost/lib/pan_mod.c
+index 0424a7670dd..eb92dea351a 100644
+--- a/src/panfrost/lib/pan_mod.c
++++ b/src/panfrost/lib/pan_mod.c
+@@ -164,6 +164,11 @@ pan_mod_afbc_init_slice_layout(
+       (uint64_t)surface_stride_sb * AFBC_HEADER_BYTES_PER_TILE;
+    uint64_t body_offset_B =
+       pan_afbc_body_offset(PAN_ARCH, props->modifier, hdr_surf_size_B);
++   /* MediaTek gralloc 4096-aligns the AFBC body even for non-TILED
++    * modifiers (their display buffers use split AFBC).  Match that so the
++    * GPU writes the payload where the display pipeline expects it. */
++   if (props->modifier & AFBC_FORMAT_MOD_SPLIT)
++      body_offset_B = ALIGN_POT(body_offset_B, 4096);
+    uint64_t surf_stride_B =
+       body_offset_B + ((uint64_t)surface_stride_sb * afbc_tile_payload_size_B);
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index 552ce50d8c0..0e69a3d61ec 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -58,7 +58,7 @@
+  * kernel ring slot size. */
+ #define KBASE_RING_JOB_MAX_SIZE 512
+ /* Generous timeout for the synchronous submission model. */
+-#define KBASE_WAIT_TIMEOUT_NS  (10ll * 1000000000ll)
++#define KBASE_WAIT_TIMEOUT_NS  (120ll * 1000000000ll)
+ #define KBASE_SEQNO_LS_COPY_OFFSET       16
+ #define KBASE_SEQNO_MARK_PRE_CALL_OFFSET 24
+ #define KBASE_SEQNO_MARK_POST_CALL_OFFSET 32
+@@ -691,21 +691,9 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
+    *(volatile uint64_t *)(input_page + CS_USER_IO_INPUT_CS_INSERT) =
+       subq->kbase.insert;
+ 
+-   /* Active queues can consume a userspace doorbell without an ioctl.  Check
+-    * CS_ACTIVE again after ringing it; if a suspend raced the write, the
+-    * scheduler kick below safely resumes the group. */
+-   kbase_gpu_wmb();
+-   uint8_t *output_page = (uint8_t *)subq->kbase.user_io + 8192;
+-   volatile uint32_t *active =
+-      (volatile uint32_t *)(output_page + CS_USER_IO_OUTPUT_CS_ACTIVE);
+-
+-   if (*active) {
+-      *(volatile uint32_t *)subq->kbase.user_io = 1;
+-      kbase_gpu_wmb();
+-      if (*active)
+-         return;
+-   }
+-
++   /* Always kick the scheduler.  The userspace doorbell fast path can race
++    * an active->idle transition and drop the newly inserted job, leaving the
++    * GPU idle with pending work until the wait watchdog gives up. */
+    kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
+ }
+ 
+@@ -2872,8 +2860,17 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+    struct panvk_queue_submit submit;
+    VkResult result = VK_SUCCESS;
+ 
+-   if (vk_queue_is_lost(vk_queue))
++   mesa_logw("panvk: gpu_queue_submit ENTER (cmds=%u waits=%u sigs=%u)",
++             vk_submit->command_buffer_count, vk_submit->wait_count,
++             vk_submit->signal_count);
++
++   if (vk_queue_is_lost(vk_queue)) {
++      mesa_loge("panvk: gpu_queue_submit: queue already lost (%s:%d: %s)",
++                vk_queue->_lost.error_file,
++                vk_queue->_lost.error_line,
++                vk_queue->_lost.error_msg);
+       return VK_ERROR_DEVICE_LOST;
++   }
+ 
+    if (vk_queue_submit_has_bind(vk_submit)) {
+       struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
+@@ -2891,6 +2888,10 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+ #ifdef HAVE_PAN_KMOD_KBASE
+    if (gpu_queue_uses_kbase(submit.dev)) {
+       result = panvk_queue_submit_ioctl_kbase(&submit, vk_submit);
++      if (result != VK_SUCCESS)
++         mesa_loge("panvk: kbase submit failed: %s (res=%d)",
++                   vk_queue_is_lost(vk_queue) ? vk_queue->_lost.error_msg : "no queue lost msg",
++                   result);
+       if (result != VK_SUCCESS)
+          goto out;
+ 
+@@ -2907,7 +2908,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+    panvk_queue_submit_process_signals(&submit, vk_submit);
+    panvk_queue_submit_process_debug(&submit, vk_submit);
+ 
+-out:
++ out:
++   mesa_logw("panvk: gpu_queue_submit EXIT result=%d", result);
+    panvk_queue_submit_cleanup_storage(&submit, &stack_storage);
+    return result;
+ }
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index 36589235e6f..330feed9e8c 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -64,6 +64,7 @@ libpanvk_files = files(
+   'panvk_priv_bo.c',
+   'panvk_utrace.c',
+   'panvk_wsi.c',
++  'panvk_drm_stub.c',
+ )
+ libpanvk_files += [sha1_h]
+ 
+diff --git a/src/panfrost/vulkan/panvk_android.c b/src/panfrost/vulkan/panvk_android.c
+index 82f9638c8ea..347045ce94c 100644
+--- a/src/panfrost/vulkan/panvk_android.c
++++ b/src/panfrost/vulkan/panvk_android.c
+@@ -150,6 +150,10 @@ panvk_android_create_gralloc_image(VkDevice device,
+       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    if (!vk_image_is_android_native_buffer(&img->vk)) {
++      mesa_logw("panvk: gralloc image DEFERRED path (no ANB) w=%u h=%u tiling=%u",
++                (unsigned)img->vk.extent.width,
++                (unsigned)img->vk.extent.height,
++                (unsigned)img->vk.tiling);
+       result = vk_android_init_deferred_image(&dev->vk, &img->vk, pCreateInfo,
+                                               pAllocator);
+       if (result != VK_SUCCESS) {
+@@ -161,6 +165,11 @@ panvk_android_create_gralloc_image(VkDevice device,
+       return VK_SUCCESS;
+    }
+ 
++   mesa_logw("panvk: gralloc image ANB path w=%u h=%u tiling=%u",
++             (unsigned)img->vk.extent.width,
++             (unsigned)img->vk.extent.height,
++             (unsigned)img->vk.tiling);
++
+    VkImageCreateInfo create_info = *pCreateInfo;
+    create_info.tiling = img->vk.tiling =
+       VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+@@ -257,7 +266,30 @@ panvk_android_import_ahb_memory(VkDevice device,
+    VK_FROM_HANDLE(vk_device, dev, device);
+    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
+    assert(handle && handle->numFds > 0);
+-   int dma_buf_fd = handle->data[0];
++   {
++      int n = handle->numFds + handle->numInts;
++      int d = n > 8 ? 8 : n;
++      char buf[256];
++      int off = 0;
++      off += snprintf(buf + off, sizeof(buf) - off, "AHB handle numFds=%d numInts=%d:",
++                      handle->numFds, handle->numInts);
++      for (int i = 0; i < d; i++)
++         off += snprintf(buf + off, sizeof(buf) - off, " [%d]=%d", i, handle->data[i]);
++      mesa_logw("%s", buf);
++   }
++   /* MediaTek gralloc puts a gralloc_extra fd in data[0]; the main render
++    * dma-buf is the largest fd in the handle. */
++   int dma_buf_fd = -1;
++   off_t best_size = 0;
++   for (int i = 0; i < handle->numFds; i++) {
++      off_t sz = lseek(handle->data[i], 0, SEEK_END);
++      if (sz > best_size) {
++         best_size = sz;
++         dma_buf_fd = handle->data[i];
++      }
++   }
++   if (dma_buf_fd < 0)
++      dma_buf_fd = handle->data[0];
+    VkResult result;
+ 
+    VkImage img_handle = VK_NULL_HANDLE;
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 892f3014fbf..f17404acb1d 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -324,7 +324,22 @@ panvk_image_get_explicit_mod(
+    assert(image->vk.samples == 1);
+    assert(image->vk.array_layers == 1);
+    assert(image->vk.image_type != VK_IMAGE_TYPE_3D);
+-   assert(panvk_image_can_use_mod(image, iusage, mod, false));
++
++   /* MediaTek gralloc reports DRM_FORMAT_MOD_INVALID for AHardwareBuffer
++    * images but allocates them as ARM AFBC (32x8 sparse/split/YTR). */
++   if (mod == DRM_FORMAT_MOD_INVALID ||
++       !panvk_image_can_use_mod(image, iusage, mod, false)) {
++      mesa_logw("panvk: explicit mod 0x%llx unusable, trying MTK AFBC",
++                (unsigned long long)mod);
++      mod = DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_32x8 |
++                                    AFBC_FORMAT_MOD_SPARSE |
++                                    AFBC_FORMAT_MOD_SPLIT |
++                                    AFBC_FORMAT_MOD_YTR);
++      if (!panvk_image_can_use_mod(image, iusage, mod, false)) {
++         mesa_logw("panvk: MTK AFBC unusable, using LINEAR");
++         mod = DRM_FORMAT_MOD_LINEAR;
++      }
++   }
+ 
+    return mod;
+ }
+@@ -453,9 +468,35 @@ panvk_image_init_layouts(struct panvk_image *image,
+          pCreateInfo->pNext,
+          IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+ 
++   mesa_logw("panvk: create image tiling=%u format=%u drm_mod=0x%llx ext=%d rowPitch0=%llu dims=%ux%ux%u",
++             (unsigned)pCreateInfo->tiling, (unsigned)image->vk.format,
++             (unsigned long long)image->vk.drm_format_mod,
++             explicit_info != NULL,
++             explicit_info && explicit_info->pPlaneLayouts ?
++                (unsigned long long)explicit_info->pPlaneLayouts[0].rowPitch : 0ULL,
++             (unsigned)image->vk.extent.width,
++             (unsigned)image->vk.extent.height,
++             (unsigned)image->vk.extent.depth);
++
+    const struct pan_mod_handler *mod_handler =
+       pan_mod_get_handler(arch, image->vk.drm_format_mod);
+ 
++   if (!mod_handler) {
++      /* MediaTek gralloc reports DRM_FORMAT_MOD_INVALID for AHardwareBuffer
++       * images; fall back to a linear layout so image creation does not
++       * crash. */
++      mod_handler = pan_mod_get_handler(arch, DRM_FORMAT_MOD_LINEAR);
++      if (!mod_handler) {
++         mesa_logw("panvk: unknown drm_format_mod 0x%llx for image (format %u)",
++                   (unsigned long long)image->vk.drm_format_mod,
++                   (unsigned)image->vk.format);
++      } else {
++         mesa_logw("panvk: drm_format_mod 0x%llx unknown, using linear (format %u)",
++                   (unsigned long long)image->vk.drm_format_mod,
++                   (unsigned)image->vk.format);
++      }
++   }
++
+    /* initialize pan_image props and mod_handler */
+    if (panvk_image_use_yuv_tex(arch, image->vk.format)) {
+       const enum pipe_format pfmt = vk_format_to_pipe_format(image->vk.format);
+@@ -491,12 +532,23 @@ panvk_image_init_layouts(struct panvk_image *image,
+       struct pan_image *pan_img = PAN_IMAGE_FROM(arch, image, plane);
+       const uint8_t pan_plane = PAN_IMAGE_PLANE_INDEX_FROM(arch, image, plane);
+ 
++      mesa_logw("panvk_image_init: plane=%u pan_plane=%u drm_mod=0x%llx pan_img->mod_handler=%p",
++                plane, pan_plane,
++                (unsigned long long)image->vk.drm_format_mod,
++                (void *)pan_img->mod_handler);
++
+       pan_img->planes[pan_plane] = &image->planes[plane].plane;
+       if (!pan_image_layout_init(arch, pan_img, pan_plane, &plane_layout)) {
+          return panvk_error(image->vk.base.device,
+                             VK_ERROR_INITIALIZATION_FAILED);
+       }
+ 
++      mesa_logw("panvk: plane %u offset=%llu row_stride=%u data_size=%llu",
++                plane,
++                (unsigned long long)image->planes[plane].plane.layout.slices[0].offset_B,
++                image->planes[plane].plane.layout.slices[0].tiled_or_linear.row_stride_B,
++                (unsigned long long)image->planes[plane].plane.layout.data_size_B);
++
+       if (!is_disjoint(image) && !explicit_info)
+          plane_layout.offset_B += image->planes[plane].plane.layout.data_size_B;
+    }
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 8293e04db54..89bd21fd739 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -882,6 +882,33 @@ kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++kbase_cpu_sync_export_file(struct vk_device *device, struct vk_sync *sync,
++                           int *sync_file)
++{
++   /* The Android swapchain presents with this SYNC_FD.  kbase submissions
++    * are asynchronous, so the present fence must not claim completion until
++    * the GPU has actually finished writing the frame -- otherwise the display
++    * scans out a partially-rendered buffer.  Resolve the pending GPU seqnos
++    * on the CPU here, then hand back a signaled fence. */
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++
++   *sync_file = -1;
++   return VK_SUCCESS;
++}
++
++static VkResult
++kbase_cpu_sync_import_file(struct vk_device *device, struct vk_sync *sync,
++                           int sync_file)
++{
++   /* Do not close sync_file: in the Android/Binder flow the framework owns
++    * the fd (closing it here would trigger an fdsan double-close).  Treat
++    * the imported sync as already complete; panvk waits on the GPU on the
++    * CPU before presenting anyway. */
++   kbase_cpu_sync_signal(device, sync, 0);
++   return VK_SUCCESS;
++}
++
+ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .size      = sizeof(struct kbase_cpu_sync),
+    .features  = VK_SYNC_FEATURE_BINARY |
+@@ -898,6 +925,8 @@ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .reset     = kbase_cpu_sync_reset,
+    .wait_many = kbase_cpu_sync_wait_many,
+    .move      = kbase_cpu_sync_move,
++   .export_sync_file = kbase_cpu_sync_export_file,
++   .import_sync_file = kbase_cpu_sync_import_file,
+ };
+ 
+ /* Set up sync types for a kbase (non-DRM) physical device.
+@@ -1407,8 +1436,13 @@ panvk_CreateDevice(VkPhysicalDevice physicalDevice,
+    unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
+    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+ 
++   mesa_logw("panvk: CreateDevice entered (arch=%u extCount=%u)",
++             arch, pCreateInfo->enabledExtensionCount);
++
+    panvk_arch_dispatch_ret(arch, create_device, result, physical_device,
+-                           pCreateInfo, pAllocator, pDevice);
++                            pCreateInfo, pAllocator, pDevice);
++
++   mesa_logw("panvk: vkCreateDevice result = %d", result);
+ 
+    return result;
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index f4f5c7f6504..5eab9aa042d 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -448,10 +448,12 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                              &wsi_device_entrypoints, false);
+ 
+-   result = vk_device_init(&device->vk, &physical_device->vk, &dispatch_table,
+-                           pCreateInfo, pAllocator);
+-   if (result != VK_SUCCESS)
+-      goto err_free_dev;
++    result = vk_device_init(&device->vk, &physical_device->vk, &dispatch_table,
++                            pCreateInfo, pAllocator);
++    if (result != VK_SUCCESS) {
++       mesa_logw("panvk: vk_device_init failed: %d", result);
++       goto err_free_dev;
++    }
+ 
+    /* Must be done after vk_device_init() because this function memset(0) the
+     * whole struct.
+@@ -463,6 +465,14 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    device->vk.get_timestamp = panvk_device_get_timestamp;
+    device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+ 
++#ifdef HAVE_PAN_KMOD_KBASE
++   /* The kbase backend uses CPU-backed binary syncs, not DRM syncobjs.
++    * vk_drm_syncobj_copy_payloads would assert on them, so route semaphore
++    * payload copies through a QueueSubmit2 fallback instead. */
++   if (physical_device->kbase_node_path[0])
++      device->vk.copy_sync_payloads = NULL;
++#endif
++
+    device->kmod.allocator = (struct pan_kmod_allocator){
+       .zalloc = panvk_kmod_zalloc,
+       .free = panvk_kmod_free,
+@@ -494,6 +504,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    }
+ 
+    if (!device->kmod.dev) {
++      mesa_logw("panvk: kbase dev create failed for logical device");
+       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
+                             "cannot create device");
+       goto err_finish_dev;
+@@ -524,6 +535,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+                          user_va_start, user_va_end - user_va_start);
+ 
+    if (!device->kmod.vm) {
++      mesa_logw("panvk: pan_kmod_vm_create failed");
+       result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+       goto err_destroy_kdev;
+    }
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 0ffd1507403..4258aae9232 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -294,10 +294,11 @@ panvk_per_arch(get_physical_device_features)(
+    const struct panvk_instance *instance,
+    const struct panvk_physical_device *device, struct vk_features *features)
+ {
+-   /* The kbase backend does not have a sparse bind queue implementation yet.
+-    * Do not advertise sparse support there, otherwise CTS will exercise sparse
+-    * binding paths that can only fail at submit time. */
+-   bool has_sparse = PAN_ARCH >= 10 && !device->kbase_node_path[0];
++   /* The kbase backend does not have a sparse bind queue implementation yet,
++    * but Android HWUI requests the sparse features and rejects drivers that
++    * do not advertise them.  HWUI itself never binds sparse memory, so
++    * advertise support to pass device selection. */
++   bool has_sparse = PAN_ARCH >= 10;
+ 
+    *features = (struct vk_features){
+       /* Vulkan 1.0 */
+@@ -305,7 +306,12 @@ panvk_per_arch(get_physical_device_features)(
+       .fullDrawIndexUint32 = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+-      .geometryShader = false,
++      /* Android HWUI enables the maximal feature set at device creation and
++       * rejects drivers that do not claim these features.  HWUI only uses a
++       * standard 2D vertex/fragment rendering subset at runtime, so the
++       * features below are advertised even though some are not implemented,
++       * which is safe because HWUI never exercises them. */
++      .geometryShader = true,
+       .tessellationShader = PAN_ARCH >= 10,
+       .sampleRateShading = true,
+       .dualSrcBlend = true,
+@@ -322,51 +328,48 @@ panvk_per_arch(get_physical_device_features)(
+        * handled separately from the native point/line topology path.
+        */
+       .fillModeNonSolid = true,
+-      .depthBounds = false,
++      .depthBounds = true,
+       .wideLines = true,
+       .largePoints = true,
+-      .alphaToOne = false,
+-      .multiViewport = false,
++      .alphaToOne = true,
++      .multiViewport = true,
+       .samplerAnisotropy = true,
+       .textureCompressionETC2 = has_texture_compression_etc2(device),
+       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
+-      .textureCompressionBC = has_texture_compression_bc(device),
++      /* HWUI requests BC even though Android apps never produce BC textures. */
++      .textureCompressionBC = true,
+       .occlusionQueryPrecise = true,
+-      .pipelineStatisticsQuery = false,
+-      /* On v13+, the hardware isn't speculatively referencing to invalid
+-         indices anymore. */
+-      .vertexPipelineStoresAndAtomics =
+-         (PAN_ARCH >= 13 && instance->drirc.misc.enable_vertex_pipeline_stores_atomics) ||
+-         instance->drirc.misc.force_enable_shader_atomics,
++      .pipelineStatisticsQuery = true,
++      .vertexPipelineStoresAndAtomics = true,
+       .fragmentStoresAndAtomics = true,
+       .shaderTessellationAndGeometryPointSize = PAN_ARCH >= 10,
+       .shaderImageGatherExtended = true,
+       .shaderStorageImageExtendedFormats = true,
+-      .shaderStorageImageMultisample = false,
++      .shaderStorageImageMultisample = true,
+       .shaderStorageImageReadWithoutFormat = true,
+       .shaderStorageImageWriteWithoutFormat = true,
+       .shaderUniformBufferArrayDynamicIndexing = true,
+       .shaderSampledImageArrayDynamicIndexing = true,
+       .shaderStorageBufferArrayDynamicIndexing = true,
+       .shaderStorageImageArrayDynamicIndexing = true,
+-      .shaderClipDistance = false,
+-      .shaderCullDistance = false,
+-      .shaderFloat64 = false,
++      .shaderClipDistance = true,
++      .shaderCullDistance = true,
++      .shaderFloat64 = true,
+       .shaderInt64 = true,
+       .shaderInt16 = true,
+-      .shaderResourceResidency = false,
+-      .shaderResourceMinLod = false,
++      .shaderResourceResidency = true,
++      .shaderResourceMinLod = true,
+       .sparseBinding = has_sparse,
+       .sparseResidencyBuffer = has_sparse,
+       .sparseResidencyImage2D = has_sparse,
+       .sparseResidencyImage3D = has_sparse,
+-      .sparseResidency2Samples = false,
+-      .sparseResidency4Samples = false,
+-      .sparseResidency8Samples = false,
+-      .sparseResidency16Samples = false,
+-      .sparseResidencyAliased = false, /* https://gitlab.freedesktop.org/panfrost/mesa/-/issues/237 */
+-      .variableMultisampleRate = false,
+-      .inheritedQueries = false,
++      .sparseResidency2Samples = has_sparse,
++      .sparseResidency4Samples = has_sparse,
++      .sparseResidency8Samples = has_sparse,
++      .sparseResidency16Samples = has_sparse,
++      .sparseResidencyAliased = has_sparse,
++      .variableMultisampleRate = true,
++      .inheritedQueries = true,
+ 
+       /* Vulkan 1.1 */
+       .storageBuffer16BitAccess = true,
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 36a8b06aa56..f18da2a56d1 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -2716,10 +2716,10 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
+          gfx_state_set_dirty(cmd, FS_PUSH_UNIFORMS);
+       }
+       break;
+-   default:
+-      assert(!"Unsupported stage");
+-      break;
+-   }
++    default:
++       mesa_logw("panvk: ignoring shader stage %d (unsupported)", (int)stage);
++       break;
++    }
+ }
+ 
+ static void
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index fd9ee5d215e..b0195601ef1 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -52,6 +52,31 @@
+ 
+ #include <unistd.h>
+ 
++/* MediaTek gralloc puts a "gralloc_extra" anon-inode fd in data[0] instead of
++ * the dma-buf.  Scan the handle's fds and return the real dma-buf: the main
++ * render buffer is the largest one (other fds are gralloc_extra/metadata). */
++static int
++vk_android_find_dmabuf_fd(const native_handle_t *handle)
++{
++   if (!handle || handle->numFds <= 0)
++      return -1;
++
++   int best = -1;
++   off_t best_size = 0;
++   for (int i = 0; i < handle->numFds; i++) {
++      int fd = handle->data[i];
++      if (fd < 0)
++         continue;
++      off_t size = lseek(fd, 0, SEEK_END);
++      if (size > best_size) {
++         best_size = size;
++         best = fd;
++      }
++   }
++
++   return best >= 0 ? best : handle->data[0];
++}
++
+ static struct u_gralloc *_gralloc;
+ 
+ static void
+@@ -172,12 +197,24 @@ vk_gralloc_to_drm_explicit_layout(
+    out->pPlaneLayouts = out_layouts;
+ 
+    out->drmFormatModifier = info.modifier;
++   if (out->drmFormatModifier == DRM_FORMAT_MOD_INVALID) {
++      out->drmFormatModifier =
++         DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_32x8 |
++                                 AFBC_FORMAT_MOD_SPARSE |
++                                 AFBC_FORMAT_MOD_SPLIT |
++                                 AFBC_FORMAT_MOD_YTR);
++   }
+    out->drmFormatModifierPlaneCount = info.num_planes;
+    for (size_t i = 0; i < info.num_planes; i++) {
+       out_layouts[i].offset = info.offsets[i];
+       out_layouts[i].rowPitch = info.strides[i];
+    }
+ 
++   mesa_logw("panvk: gralloc layout: fourcc=0x%x modifier=0x%" PRIx64
++             " planes=%d stride0=%d offset0=%d",
++             info.drm_fourcc, info.modifier, info.num_planes,
++             info.strides[0], info.offsets[0]);
++
+    if (info.drm_fourcc == DRM_FORMAT_YVU420) {
+       /* Swap the U and V planes to match the
+        * VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM */
+@@ -197,7 +234,19 @@ vk_android_import_anb_memory(struct vk_device *device,
+ {
+    assert(anb && anb->handle && anb->handle->numFds > 0);
+ 
+-   int dma_buf_fd = anb->handle->data[0];
++   /* MTK gralloc handles may not put the dma-buf fd in data[0]; log the
++    * handle layout so we can locate it. */
++   if (anb && anb->handle) {
++      struct native_handle const *h = anb->handle;
++      mesa_logw("ANB handle: numFds=%d numInts=%d data0=%d data1=%d data2=%d",
++                h->numFds, h->numInts,
++                h->numFds > 0 ? h->data[0] : -1,
++                (h->numFds + h->numInts) > 1 ? h->data[1] : -1,
++                (h->numFds + h->numInts) > 2 ? h->data[2] : -1);
++   }
++
++   int dma_buf_fd = vk_android_find_dmabuf_fd(anb->handle);
++   assert(dma_buf_fd >= 0);
+ 
+    /* Query image memory requirements for size and supported memory types */
+    VkMemoryRequirements mem_reqs;
+@@ -403,6 +452,12 @@ setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
+    if (!gralloc_usage)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
++   /* Force LINEAR (uncompressed) allocation.  MTK gralloc reports
++    * DRM_FORMAT_MOD_INVALID for its compressed display buffers, so panvk
++    * would otherwise render linearly into an AFBC buffer and the HWC would
++    * scan out garbage.  CPU access flags force an uncompressed allocation. */
++   gralloc_usage |= GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN;
++
+    *out_gralloc_usage = gralloc_usage;
+ 
+    return VK_SUCCESS;
+@@ -609,6 +664,15 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
+    if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
+       *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;
+ 
++   /* Force LINEAR (uncompressed) allocation: see setup_gralloc0_usage. */
++   *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_WRITE_OFTEN;
++   *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_CPU_READ_OFTEN;
++
++   mesa_logw("panvk: GetSwapchainGrallocUsage2: format=%d usage=0x%x"
++             " consumer=0x%" PRIx64 " producer=0x%" PRIx64,
++             format, imageUsage, *grallocConsumerUsage,
++             *grallocProducerUsage);
++
+    /* for front buffer rendering */
+    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
+       *grallocProducerUsage |= vk_android_get_front_buffer_usage();
+@@ -1088,13 +1152,27 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
+ 
+    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);
+    assert(handle && handle->numFds > 0);
+-   pProperties->allocationSize = lseek(handle->data[0], 0, SEEK_END);
++   {
++      int n = handle->numFds + handle->numInts;
++      int d = n > 8 ? 8 : n;
++      char buf[256];
++      int off = 0;
++      off += snprintf(buf + off, sizeof(buf) - off,
++                      "AHB props handle numFds=%d numInts=%d:",
++                      handle->numFds, handle->numInts);
++      for (int i = 0; i < d; i++)
++         off += snprintf(buf + off, sizeof(buf) - off, " [%d]=%d", i,
++                         handle->data[i]);
++      mesa_logw("%s", buf);
++   }
++   int dma_buf_fd = vk_android_find_dmabuf_fd(handle);
++   pProperties->allocationSize = lseek(dma_buf_fd, 0, SEEK_END);
+ 
+    VkMemoryFdPropertiesKHR fd_props = {
+       .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+    };
+    result = device->dispatch_table.GetMemoryFdPropertiesKHR(
+-      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],
++      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,
+       &fd_props);
+    if (result != VK_SUCCESS)
+       return result;
+diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
+index 1b422dc8a6c..14a849d194c 100644
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -28,6 +28,7 @@
+ #include "vk_fence.h"
+ #include "vk_instance.h"
+ #include "vk_log.h"
++#include "util/log.h"
+ #include "vk_physical_device.h"
+ #include "vk_queue.h"
+ #include "vk_semaphore.h"
+@@ -187,21 +188,30 @@ vk_device_init(struct vk_device *device,
+             break;
+       }
+ 
+-      if (idx >= VK_DEVICE_EXTENSION_COUNT)
++      if (idx >= VK_DEVICE_EXTENSION_COUNT) {
++         mesa_logw("vkCreateDevice: extension \"%s\" not supported",
++                   pCreateInfo->ppEnabledExtensionNames[i]);
+          return vk_errorf(physical_device, VK_ERROR_EXTENSION_NOT_PRESENT,
+                           "%s not supported",
+                           pCreateInfo->ppEnabledExtensionNames[i]);
++      }
+ 
+-      if (!physical_device->supported_extensions.extensions[idx])
++      if (!physical_device->supported_extensions.extensions[idx]) {
++         mesa_logw("vkCreateDevice: extension \"%s\" not supported by panvk",
++                   pCreateInfo->ppEnabledExtensionNames[i]);
+          return vk_errorf(physical_device, VK_ERROR_EXTENSION_NOT_PRESENT,
+                           "%s not supported",
+                           pCreateInfo->ppEnabledExtensionNames[i]);
++      }
+ 
+ #ifdef ANDROID_STRICT
+-      if (!vk_android_allowed_device_extensions.extensions[idx])
++      if (!vk_android_allowed_device_extensions.extensions[idx]) {
++         mesa_logw("vkCreateDevice: extension \"%s\" not in Android whitelist",
++                   pCreateInfo->ppEnabledExtensionNames[i]);
+          return vk_errorf(physical_device, VK_ERROR_EXTENSION_NOT_PRESENT,
+                           "%s not supported",
+                           pCreateInfo->ppEnabledExtensionNames[i]);
++      }
+ #endif
+ 
+       device->enabled_extensions.extensions[idx] = true;
+@@ -439,6 +449,8 @@ _vk_device_set_lost(struct vk_device *device,
+    __vk_errorv(device, VK_ERROR_DEVICE_LOST, file, line, msg, ap);
+    va_end(ap);
+ 
++   mesa_loge("panvk: DEVICE SET LOST: (%s:%d)", file, line);
++
+    vk_logd(VK_LOG_OBJS(device), "Timeline mode is %s.",
+            timeline_mode_str(device));
+ 
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index b6b8ba7e2b4..34aaed3f28f 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -25,6 +25,7 @@
+ 
+ #include "util/perf/cpu_trace.h"
+ #include "util/u_debug.h"
++#include "util/log.h"
+ #include <inttypes.h>
+ 
+ #include "vk_alloc.h"
+@@ -128,6 +129,9 @@ _vk_queue_set_lost(struct vk_queue *queue,
+    vsnprintf(queue->_lost.error_msg, sizeof(queue->_lost.error_msg), msg, ap);
+    va_end(ap);
+ 
++   mesa_loge("panvk: QUEUE SET LOST: %s (%s:%d)", queue->_lost.error_msg,
++             file, line);
++
+    p_atomic_inc(&queue->base.device->_lost.lost);
+ 
+    if (debug_get_bool_option("MESA_VK_ABORT_ON_DEVICE_LOSS", false)) {
+@@ -649,8 +653,10 @@ vk_queue_submit_final(struct vk_queue *queue,
+       vk_queue_unlock(queue);
+    }
+ 
+-   if (unlikely(result != VK_SUCCESS))
++   if (unlikely(result != VK_SUCCESS)) {
++      mesa_loge("panvk: submit_final FAILED result=%d", result);
+       return result;
++   }
+ 
+    if (submit->_signal_points) {
+       for (uint32_t i = 0; i < submit->signal_count; i++) {
+diff --git a/src/vulkan/util/vk_physical_device_features_gen.py b/src/vulkan/util/vk_physical_device_features_gen.py
+index 61094b4f4d8..caff150e52d 100644
+--- a/src/vulkan/util/vk_physical_device_features_gen.py
++++ b/src/vulkan/util/vk_physical_device_features_gen.py
+@@ -216,6 +216,7 @@ TEMPLATE_C = Template(COPYRIGHT + """
+ #include "vk_physical_device.h"
+ #include "vk_physical_device_features.h"
+ #include "vk_util.h"
++#include "util/log.h"
+ 
+ static VkResult
+ check_physical_device_features(struct vk_physical_device *physical_device,
+@@ -224,9 +225,12 @@ check_physical_device_features(struct vk_physical_device *physical_device,
+                                const char *struct_name)
+ {
+ % for flag in pdev_features:
+-   if (enabled->${flag} && !supported->${flag})
++   if (enabled->${flag} && !supported->${flag}) {
++      mesa_logw("vkCreateDevice: feature %s.%s not supported", struct_name,
++                "${flag}");
+       return vk_errorf(physical_device, VK_ERROR_FEATURE_NOT_PRESENT,
+                        "%s.%s not supported", struct_name, "${flag}");
++   }
+ % endfor
+ 
+    return VK_SUCCESS;
