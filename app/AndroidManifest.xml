@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dsh.gputest"
+    android:versionCode="1"
+    android:versionName="0.1">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:required="false" />
+
+    <application android:label="GPU 驱动测试台" android:debuggable="true">
+        <activity android:name=".MainActivity"
+                  android:exported="true"
+                  android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
